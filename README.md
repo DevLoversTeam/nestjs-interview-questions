@@ -3628,12 +3628,182 @@ persistence-логіки.
 
 #### NestJS
 
+Міграції - це версіоновані, явні скрипти змін схеми бази даних. Вони дають
+команді можливість еволюціонувати схему безпечно і передбачувано між
+середовищами.
+
+У TypeORM/Prisma міграції - це production-safe спосіб застосовувати зміни схеми.
+
+#### Що таке міграції
+
+1. **Впорядкована історія схеми**
+   Кожна міграція - це відстежуваний крок (up/down) в еволюції схеми.
+
+2. **Відтворювані деплої**
+   Ті самі зміни схеми консистентно застосовуються в dev/staging/prod.
+
+3. **Рев'юваний набір змін**
+   Намір SQL/DDL видно в code review і CI.
+
+4. **Стратегія rollback**
+   Проблемні зміни можна відкотити (з урахуванням обмежень).
+
+#### Модель міграцій у TypeORM vs Prisma
+
+1. **TypeORM**
+   Міграції - це TS/JS-файли (або SQL), які генеруються/пишуться і виконуються
+   через CLI.
+
+2. **Prisma**
+   Зміни схеми описуються в `schema.prisma`; файли міграцій генеруються і
+   застосовуються через Prisma Migrate.
+
+Обидва підходи створюють аудитні migration-артефакти.
+
+#### Чому `synchronize: true` небезпечний у production
+
+1. **Неявні руйнівні зміни**
+   ORM може автоматично змінювати/видаляти колонки та індекси без контрольованого
+   рев'ю.
+
+2. **Недетермінована поведінка**
+   Поведінка schema-diff може відрізнятися через drift entities і runtime-стан.
+
+3. **Відсутність коректної історії міграцій**
+   Складно аудіювати, що саме і коли змінилось.
+
+4. **Ризикований зв'язок зі стартом застосунку**
+   Під час boot застосунок може неочікувано мутувати production-схему.
+
+5. **Погана безпека при multi-instance**
+   Паралельні старти інстансів можуть змагатись за оновлення схеми.
+
+#### Production-safe workflow
+
+1. Ставте `synchronize: false` у production.
+2. Генеруйте міграцію для кожної зміни схеми.
+3. Рев'юйте SQL міграцій у PR.
+4. Запускайте міграції в deployment pipeline до/разом із rollout застосунку.
+5. Моніторте виконання міграцій і фейліть деплой при помилках.
+
+#### Практичні приклади
+
+TypeORM production-конфіг:
+
+```ts
+TypeOrmModule.forRoot({
+  // ...
+  synchronize: false,
+  migrationsRun: false,
+});
+```
+
+Підхід для деплою Prisma:
+1. Комітьте файли міграцій.
+2. Запускайте `prisma migrate deploy` під час релізу.
+
+#### Правило практики
+
+`synchronize: true` використовуйте лише для швидкого локального прототипування.
+Для будь-якого серйозного середовища міграції обов'язкові заради безпеки,
+трасованості й контрольованої еволюції схеми.
+
 </details>
 
 <details>
 <summary>47. Як реалізувати soft delete в TypeORM?</summary>
 
 #### NestJS
+
+Soft delete означає, що записи позначаються як видалені, а не видаляються
+фізично з бази даних. У TypeORM це зазвичай робиться через `@DeleteDateColumn`.
+
+#### Навіщо використовувати soft delete
+
+1. Відновлення випадково видалених даних.
+2. Збереження audit/history контексту.
+3. Збереження foreign key зв'язків і бізнес-трасованості.
+4. Підтримка сценаріїв "кошик/відновлення".
+
+#### Крок 1: Додайте колонку часу видалення
+
+```ts
+import { Column, DeleteDateColumn, Entity, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity('users')
+export class UserEntity {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ unique: true })
+  email: string;
+
+  @DeleteDateColumn({ name: 'deleted_at', nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+#### Крок 2: Використовуйте soft-delete методи репозиторію
+
+```ts
+// позначити як видалений (встановлює deletedAt)
+await this.usersRepo.softDelete(userId);
+
+// відновити soft-deleted запис
+await this.usersRepo.restore(userId);
+```
+
+Також можна використовувати:
+1. `softRemove(entity)` для видалення інстансу entity.
+2. `recover(entity)` для відновлення інстансу.
+
+#### Поведінка запитів
+
+1. За замовчуванням TypeORM виключає soft-deleted записи зі стандартних
+   `find*` запитів.
+2. Щоб включити видалені записи, використовуйте `withDeleted: true`.
+
+```ts
+const allRows = await this.usersRepo.find({ withDeleted: true });
+```
+
+Тільки видалені записи:
+
+```ts
+const deletedOnly = await this.usersRepo.find({
+  withDeleted: true,
+  where: { deletedAt: Not(IsNull()) },
+});
+```
+
+#### Приклад на рівні сервісу
+
+```ts
+async removeUser(id: number) {
+  const result = await this.usersRepo.softDelete(id);
+  if (!result.affected) throw new NotFoundException('User not found');
+}
+
+async restoreUser(id: number) {
+  const result = await this.usersRepo.restore(id);
+  if (!result.affected) throw new NotFoundException('User not found');
+}
+```
+
+#### Production-моменти
+
+1. Додавайте індекси для полів, що часто фільтруються (`deleted_at`,
+   tenant-ключі).
+2. Переконайтесь, що unique constraints враховують soft-deleted рядки
+   (partial unique indexes, де підтримується).
+3. Визначте retention policy для eventual hard cleanup.
+4. Фіксуйте події видалення/відновлення в audit logs.
+
+#### Правило практики
+
+Використовуйте soft delete для user/business даних, які можуть вимагати
+відновлення або аудиту. Hard delete застосовуйте лише там, де політики
+compliance/storage або доменні правила вимагають постійного видалення.
 
 </details>
 
@@ -3642,12 +3812,179 @@ persistence-логіки.
 
 #### NestJS
 
+Транзакції гарантують, що група операцій з БД або виконується повністю, або
+повністю відкочується. У NestJS + TypeORM використовуйте транзакції для
+багатокрокових записів, де критична консистентність.
+
+#### Коли транзакції обов'язкові
+
+1. Створення/оновлення кількох пов'язаних таблиць в одному use-case.
+2. Операції з балансом/грошима/залишками.
+3. Сценарії, де частковий успіх пошкоджує бізнес-стан.
+
+#### Основні підходи в TypeORM
+
+1. **`DataSource.transaction(...)`** (рекомендований дефолт)
+2. **`QueryRunner`** (ручний контроль для складних сценаріїв)
+
+#### Підхід 1: `DataSource.transaction` (чисто і безпечно)
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async createOrder(input: { userId: number; items: Array<{ sku: string; qty: number }> }) {
+    return this.dataSource.transaction(async manager => {
+      const order = manager.create(OrderEntity, { userId: input.userId });
+      await manager.save(order);
+
+      for (const item of input.items) {
+        const row = manager.create(OrderItemEntity, {
+          orderId: order.id,
+          sku: item.sku,
+          qty: item.qty,
+        });
+        await manager.save(row);
+      }
+
+      return order;
+    });
+  }
+}
+```
+
+Важливо: всередині callback транзакції використовуйте репозиторії/entity через
+`manager`, а не глобально інжектені репозиторії.
+
+#### Підхід 2: `QueryRunner` (fine-grained контроль)
+
+```ts
+const qr = dataSource.createQueryRunner();
+await qr.connect();
+await qr.startTransaction();
+try {
+  // use qr.manager for all queries
+  await qr.manager.save(entityA);
+  await qr.manager.save(entityB);
+  await qr.commitTransaction();
+} catch (e) {
+  await qr.rollbackTransaction();
+  throw e;
+} finally {
+  await qr.release();
+}
+```
+
+#### Best practices
+
+1. Тримайте scope транзакції коротким і сфокусованим.
+2. Уникайте зовнішніх HTTP-викликів усередині DB-транзакції.
+3. Використовуйте потрібний isolation level для concurrency-чутливих сценаріїв.
+4. Продумайте deadlock/retry стратегію для high-contention операцій.
+5. Публікуйте domain events після успішного commit (або використовуйте outbox pattern).
+
+#### Поширені помилки
+
+1. Змішування транзакційних і нетранзакційних репозиторіїв в одному flow.
+2. Довгі транзакції, що створюють lock contention.
+3. Поглинання помилок із commit неузгодженого стану.
+
+#### Практичне правило
+
+Один бізнес-use-case загортайте в одну межу транзакції, коли консистентність між
+кількома записами є безкомпромісною вимогою.
+
 </details>
 
 <details>
 <summary>49. Що таке N+1 проблема і як її вирішити в NestJS?</summary>
 
 #### NestJS
+
+Проблема N+1 виникає, коли застосунок виконує:
+1. один запит для завантаження списку батьківських записів,
+2. а потім ще по одному запиту на кожен батьківський запис для пов'язаних даних.
+
+У підсумку маємо `1 + N` запитів, високу затримку і зайве навантаження на БД.
+
+#### Приклад N+1
+
+1. Запит користувачів (`N` користувачів у результаті).
+2. Для кожного користувача окремий запит до posts.
+3. Загалом запитів: `1 + N`.
+
+Для 100 користувачів це вже 101 round-trip до БД.
+
+#### Де це з'являється в NestJS-застосунках
+
+1. Lazy access до relation у TypeORM всередині циклів.
+2. GraphQL resolvers, які резолвлять вкладені поля для кожної entity.
+3. Методи сервісів із повторними per-item викликами репозиторію.
+
+#### Як це вирішувати
+
+1. **Eager load через joins**
+   Використовуйте joins у query builder, щоб отримати relation-дані одним
+   запитом (або контрольованою малою кількістю запитів).
+
+2. **Batch loading**
+   Використовуйте batching у стилі DataLoader (особливо в GraphQL).
+
+3. **IN queries**
+   Завантажуйте пов'язані рядки для всіх parent ID одразу і мапте в пам'яті.
+
+4. **Оптимізація проєкції**
+   Вибирайте лише потрібні колонки, щоб зменшити payload.
+
+#### Приклад join у TypeORM
+
+```ts
+const users = await this.usersRepo
+  .createQueryBuilder('u')
+  .leftJoinAndSelect('u.posts', 'p')
+  .getMany();
+```
+
+#### Приклад batch loading патерну
+
+```ts
+const users = await this.usersRepo.find();
+const userIds = users.map(u => u.id);
+
+const posts = await this.postsRepo.find({
+  where: { userId: In(userIds) },
+});
+
+const byUser = new Map<number, PostEntity[]>();
+for (const post of posts) {
+  const arr = byUser.get(post.userId) ?? [];
+  arr.push(post);
+  byUser.set(post.userId, arr);
+}
+```
+
+#### Сигнали виявлення
+
+1. Різке зростання кількості запитів із ростом result set.
+2. Затримка endpoint-а росте майже лінійно з кількістю parent-рядків.
+3. Повторювані схожі SQL-запити в логах/моніторингу.
+
+#### Практична стратегія запобігання
+
+1. Увімкніть SQL/query logging у non-prod performance-тестах.
+2. Додавайте query-count асерти для критичних endpoint-ів.
+3. Віддавайте перевагу repository-методам, спроєктованим для aggregate-читання.
+4. Переглядайте GraphQL resolvers на предмет per-field DB-викликів.
+
+#### Правило практики
+
+Якщо endpoint завантажує колекції з relation-даними, проєктуйте доступ до даних
+заздалегідь під batching/joins. Не покладайтесь на per-item lazy-fetch цикли в
+production-коді.
 
 </details>
 
@@ -3656,12 +3993,171 @@ persistence-логіки.
 
 #### NestJS
 
+Connection pooling - це керований набір повторно використовуваних підключень до
+БД, спільних між запитами. Замість створення нового підключення для кожного
+запиту застосунок бере конекшн із пулу і повертає його після використання.
+
+#### Чому pooling важливий
+
+1. Зменшує накладні витрати на встановлення підключень.
+2. Покращує throughput/latency під навантаженням.
+3. Запобігає перевантаженню БД через неконтрольовані піки підключень.
+4. Стабілізує поведінку при одночасних запитах.
+
+#### Ключові параметри пулу
+
+1. **max pool size**
+   Максимальна кількість одночасних підключень до БД від одного інстансу.
+
+2. **min pool size** (залежить від драйвера)
+   Мінімальна кількість idle-підключень, які тримаються відкритими.
+
+3. **acquire timeout**
+   Скільки чекати вільне підключення.
+
+4. **idle timeout**
+   Скільки тримати невикористовувані підключення до закриття.
+
+5. **max lifetime**
+   Максимальний вік підключення до ротації.
+
+#### Стратегія sizing (практична)
+
+1. Починайте від ліміту БД і кількості реплік застосунку:
+   `pool_max_per_instance * replica_count < db_connection_limit - safety_margin`.
+
+2. Залишайте запас для:
+   1. Міграцій/admin інструментів
+   2. Фонових воркерів
+   3. Неочікуваних сплесків трафіку
+
+3. Навантажувально тестуйте і тюньте за:
+   1. часом очікування на отримання конекшну
+   2. DB CPU
+   3. lock contention
+   4. p95/p99 latency
+
+#### Приклад TypeORM/NestJS (Postgres)
+
+```ts
+TypeOrmModule.forRoot({
+  type: 'postgres',
+  url: process.env.DATABASE_URL,
+  synchronize: false,
+  extra: {
+    max: 20,                  // pool max connections
+    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 30000,
+  },
+});
+```
+
+#### Operational best practices
+
+1. Використовуйте один глобальний DataSource на процес застосунку (не створюйте
+   багато пулів).
+2. Налаштовуйте query timeouts і statement timeouts.
+3. Моніторте метрики пулу: active, idle, waiting.
+4. Тюньте під реальне навантаження, а не за дефолтами.
+5. Для serverless/дуже еластичних сценаріїв розгляньте PgBouncer або
+   provider-managed pooling.
+
+#### Поширені помилки
+
+1. Занадто великий пул -> DB thrashing/тиск на блокування.
+2. Занадто малий пул -> черги запитів/таймаути.
+3. Ігнорування мультиплікатора горизонтального масштабування між репліками.
+4. Ручне відкриття нових клієнтів у request-handler-ах.
+
+#### Правило практики
+
+Розмір connection pool - це системне capacity-рішення, а не лише ORM-настройка.
+Тюньте його з урахуванням production-like навантаження та лімітів БД.
+
 </details>
 
 <details>
 <summary>51. Як захиститись від SQL injection у TypeORM/Prisma?</summary>
 
 #### NestJS
+
+Захист від SQL injection у NestJS з TypeORM/Prisma базується на одному принципі:
+**ніколи не будуйте SQL через конкатенацію рядків з недовіреним вводом**.
+
+Використовуйте parameterized queries і ORM API, які безпечно bind-ять значення.
+
+#### Безпечні дефолтні підходи
+
+1. **TypeORM repository/query builder з параметрами**
+2. **Prisma client methods із типізованими фільтрами**
+3. **DTO валідація + парсинг до того, як дані потрапляють у persistence-шар**
+
+#### Безпечні патерни TypeORM
+
+Repository API:
+
+```ts
+await usersRepo.findOne({ where: { email: input.email } });
+```
+
+QueryBuilder із bound params:
+
+```ts
+await usersRepo
+  .createQueryBuilder('u')
+  .where('u.email = :email', { email: input.email })
+  .andWhere('u.status = :status', { status: 'active' })
+  .getMany();
+```
+
+#### Безпечні патерни Prisma
+
+```ts
+await prisma.user.findMany({
+  where: {
+    email: input.email,
+    status: 'active',
+  },
+});
+```
+
+Prisma у стандартних client-методах генерує parameterized queries "під капотом".
+
+#### Небезпечні anti-pattern-и
+
+1. Raw SQL зі string interpolation:
+
+```ts
+// BAD
+await dataSource.query(`SELECT * FROM users WHERE email = '${input.email}'`);
+```
+
+2. Небезпечний dynamic `ORDER BY` / назви колонок із user input.
+3. Передача невалідованих фрагментів у raw query-функції.
+
+#### Якщо raw SQL неминучий
+
+1. Використовуйте placeholders для параметрів:
+
+```ts
+await dataSource.query('SELECT * FROM users WHERE email = $1', [input.email]);
+```
+
+2. Явно whitelist-іть dynamic identifiers (поля сортування/колонки):
+   мапте input -> відомий безпечний SQL token.
+
+#### Defense in depth
+
+1. Валідовуйте і санітизуйте input через DTO + `ValidationPipe`.
+2. Використовуйте DB-акаунти з мінімально необхідними правами.
+3. Вимикайте небезпечні DB-права (drop/alter, де не потрібно).
+4. Логуйте підозрілі query-патерни і невдалі auth-спроби.
+5. Додавайте security-тести з injection payload для критичних endpoint-ів.
+
+#### Практичне правило
+
+Залишайтесь на ORM API для 95% запитів. Для решти raw SQL-випадків завжди
+bind-іть параметри і whitelist-іть будь-яку dynamic SQL-структуру.
 
 </details>
 
@@ -3670,12 +4166,179 @@ persistence-логіки.
 
 #### NestJS
 
+Правильний дизайн pagination у REST API має бути стабільним, продуктивним і
+передбачуваним для клієнтів. Основні моделі - offset-based і cursor-based
+pagination.
+
+#### Offset vs cursor: ключова різниця
+
+1. **Offset pagination**
+   Використовує `limit` + `offset` (або page/pageSize).
+   Приклад: `GET /users?limit=20&offset=40`.
+
+2. **Cursor pagination**
+   Використовує вказівник на останній побачений запис у відсортованому потоці.
+   Приклад: `GET /users?limit=20&cursor=eyJpZCI6MTIzfQ==`.
+
+#### Коли використовувати offset pagination
+
+1. Малі/середні обсяги даних.
+2. Потрібні довільні переходи по сторінках (`page=7`).
+3. Прості admin dashboard/backoffice інструменти.
+
+Компроміси:
+1. Повільніше на великих offset.
+2. Нестабільні сторінки при конкурентних insert/delete.
+
+#### Коли використовувати cursor pagination
+
+1. Великі набори даних, що часто змінюються.
+2. Infinite scroll/mobile стрічки.
+3. Performance-sensitive API.
+
+Переваги:
+1. Краща продуктивність БД на масштабі.
+2. Стабільніше впорядкування при конкурентних записах.
+
+Компроміс:
+1. Немає природного довільного переходу на сторінку.
+
+#### Базові правила дизайну (для обох моделей)
+
+1. Завжди задавайте детермінований порядок сортування:
+   наприклад, `ORDER BY created_at DESC, id DESC`.
+
+2. Примусово обмежуйте максимальний розмір сторінки на сервері.
+
+3. Повертайте pagination-метадані:
+   `hasNext`, `nextCursor` (cursor-модель) або `total` (offset-модель за потреби).
+
+4. Валідовуйте параметри pagination через DTO + pipes.
+
+#### Приклади форми відповіді
+
+Offset:
+
+```json
+{
+  "data": [...],
+  "meta": { "limit": 20, "offset": 40, "total": 312, "hasNext": true }
+}
+```
+
+Cursor:
+
+```json
+{
+  "data": [...],
+  "meta": { "limit": 20, "nextCursor": "eyJjcmVhdGVkQXQiOiIyMDI2LTA0LTMwVDEwOjAwOjAwWiIsImlkIjoxMjN9", "hasNext": true }
+}
+```
+
+#### Нотатки щодо реалізації в NestJS
+
+1. Створюйте окремі DTO: `OffsetPaginationDto`, `CursorPaginationDto`.
+2. Тримайте pagination-логіку в repository/query шарі, а не в контролері.
+3. Кодуйте cursor як opaque token (base64/json + опційний підпис).
+4. Переконайтесь, що індекси БД відповідають ключам сортування/фільтрації
+   (`created_at`, `id`, tenant fields).
+
+#### Практична рекомендація
+
+1. Використовуйте **offset** для простих внутрішніх endpoint-ів.
+2. Використовуйте **cursor** для публічних/high-volume стрічок.
+3. Якщо сумніваєтесь, для write-heavy timeline краще стартувати з cursor, щоб
+   уникнути майбутніх проблем продуктивності та консистентності.
+
 </details>
 
 <details>
 <summary>53. Як версіонувати API у NestJS? (URI, Header, Media type versioning)</summary>
 
 #### NestJS
+
+Версіонування API у NestJS дозволяє еволюціонувати endpoint-и без поломки
+існуючих клієнтів. Nest підтримує стратегії URI, custom header і media type
+versioning.
+
+#### Стратегії версіонування
+
+1. **URI versioning**
+   Версія в path: `/v1/users`, `/v2/users`.
+
+2. **Header versioning**
+   Версія в кастомному header (наприклад, `X-API-Version: 2`).
+
+3. **Media type versioning**
+   Версія в media type заголовка `Accept`
+   (наприклад, `application/vnd.myapp.v2+json`).
+
+#### Увімкнення версіонування в NestJS
+
+```ts
+import { NestFactory, VersioningType } from '@nestjs/core';
+
+const app = await NestFactory.create(AppModule);
+
+app.enableVersioning({
+  type: VersioningType.URI, // або HEADER / MEDIA_TYPE
+  defaultVersion: '1',
+});
+```
+
+#### Оголошення версій на контролерах/роутах
+
+На рівні контролера:
+
+```ts
+@Controller({ path: 'users', version: '1' })
+export class UsersV1Controller {}
+```
+
+На рівні маршруту:
+
+```ts
+@Get()
+@Version('2')
+findAllV2() {}
+```
+
+Кілька версій для одного handler-а:
+
+```ts
+@Version(['1', '2'])
+```
+
+#### Вибір стратегії
+
+1. **URI versioning** (найпоширеніший)
+   1. Легко дебажити і кешувати.
+   2. Чітко видно в логах і документації.
+   3. Найкращий дефолт для публічних REST API.
+
+2. **Header versioning**
+   1. Зберігає чисті URL.
+   2. Зручний у контрольованих enterprise-клієнтах.
+   3. Складніше тестується вручну і кешується за замовчуванням.
+
+3. **Media type versioning**
+   1. Стандартоорієнтований стиль content negotiation.
+   2. Найскладніший для клієнтів/інструментів.
+
+#### Практичні best practices
+
+1. Впроваджуйте versioning до першої breaking-зміни.
+2. Тримайте вікно backward compatibility і політику deprecation.
+3. Версіонуйте лише тоді, коли зміни контракту справді breaking.
+4. Документуйте sunset timeline для старих версій.
+5. Спільну бізнес-логіку тримайте в сервісах; версіонуйте переважно
+   transport-шар.
+
+#### Правило практики
+
+Для більшості команд варто стартувати з **URI versioning**, бо це явно і
+операційно просто. Header/media type versioning використовуйте лише за чітких
+платформних вимог.
 
 </details>
 
@@ -3684,12 +4347,176 @@ persistence-логіки.
 
 #### NestJS
 
+Swagger у NestJS реалізується через `@nestjs/swagger`, щоб автоматично
+генерувати OpenAPI-документацію з контролерів, DTO і декораторів.
+
+#### Крок 1: встановіть пакети
+
+1. `@nestjs/swagger`
+2. `swagger-ui-express`
+
+#### Крок 2: налаштуйте Swagger у `main.ts`
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  const config = new DocumentBuilder()
+    .setTitle('NestJS Interview API')
+    .setDescription('API documentation')
+    .setVersion('1.0.0')
+    .addBearerAuth()
+    .build();
+
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('docs', app, document);
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+URL документації буде `/docs`.
+
+#### Крок 3: анотуйте контролери і DTO
+
+Анотації контролера:
+
+```ts
+import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+
+@ApiTags('users')
+@ApiBearerAuth()
+@Controller('users')
+export class UsersController {
+  @Get(':id')
+  @ApiOperation({ summary: 'Get user by id' })
+  @ApiResponse({ status: 200, description: 'User found' })
+  @ApiResponse({ status: 404, description: 'User not found' })
+  findOne() {}
+}
+```
+
+Анотації DTO:
+
+```ts
+import { ApiProperty } from '@nestjs/swagger';
+
+export class CreateUserDto {
+  @ApiProperty({ example: 'john@example.com' })
+  email: string;
+
+  @ApiProperty({ minLength: 8 })
+  password: string;
+}
+```
+
+#### Крок 4: тримайте схеми актуальними
+
+1. Використовуйте class-based DTO (не interface) для runtime metadata.
+2. Комбінуйте з `ValidationPipe`, щоб документація відповідала реальним
+   обмеженням.
+3. Явно документуйте auth, pagination і error-моделі.
+
+#### Розширені практики для production
+
+1. Генеруйте docs для кожної версії API, якщо увімкнене versioning.
+2. Ховайте внутрішні/admin endpoint-и, коли потрібно.
+3. Використовуйте `operationIdFactory` для стабільної генерації SDK.
+4. Експортуйте OpenAPI JSON у CI для contract-check/client codegen.
+5. Захищайте docs endpoint у production, якщо API приватне.
+
+#### Практичний висновок
+
+Сприймайте Swagger як контрактний артефакт, а не лише UI. Оновлюйте декоратори
+та DTO одночасно зі змінами endpoint-ів, щоб уникати розсинхрону документації.
+
 </details>
 
 <details>
 <summary>55. Як реалізувати CORS у NestJS і коли потрібні кастомні налаштування?</summary>
 
 #### NestJS
+
+CORS (Cross-Origin Resource Sharing) визначає, які браузерні origin-и можуть
+звертатися до вашого API. У NestJS CORS налаштовується на рівні bootstrap
+застосунку.
+
+#### Базове увімкнення CORS
+
+```ts
+const app = await NestFactory.create(AppModule);
+app.enableCors();
+```
+
+Для локальної розробки цього зазвичай достатньо, але для production це занадто
+широкий доступ.
+
+#### Production-стиль конфігурації CORS
+
+```ts
+app.enableCors({
+  origin: ['https://app.example.com', 'https://admin.example.com'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  maxAge: 86400,
+});
+```
+
+#### Коли потрібні кастомні CORS-налаштування
+
+1. **Кілька frontend-доменів**
+   Потрібен явний allowlist для кожного середовища.
+
+2. **Cookie-based auth (`credentials: true`)**
+   Потрібен конкретний origin (не `*`) і коректна політика безпечних cookies.
+
+3. **Кастомні headers/токени**
+   Потрібно додати необхідні заголовки в `allowedHeaders`.
+
+4. **Складні методи/preflight**
+   Треба налаштувати `methods` і переконатися, що `OPTIONS` працює коректно.
+
+5. **Per-tenant або dynamic origin правила**
+   Використовуйте function-based origin resolver.
+
+#### Приклад dynamic origin
+
+```ts
+app.enableCors({
+  origin: (origin, callback) => {
+    const allowlist = new Set([
+      'https://app.example.com',
+      'https://staging.example.com',
+    ]);
+
+    if (!origin || allowlist.has(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+});
+```
+
+#### Поширені помилки
+
+1. `origin: '*'` разом із `credentials: true` (некоректно/небезпечно для cookie).
+2. Ігнорування preflight (`OPTIONS`) у proxy/gateway.
+3. Хардкод одного origin для всіх середовищ.
+4. Сприйняття CORS як security boundary для небраузерних клієнтів.
+
+#### Практичні рекомендації
+
+1. Тримайте strict origin allowlist у production.
+2. Розділяйте CORS-конфіг за середовищами через `ConfigService`.
+3. Логуйте заблоковані origin-и для дебагу.
+4. Комбінуйте CORS із реальною auth/authz, rate limiting і CSRF-стратегією там,
+   де це доречно.
 
 </details>
 
@@ -3698,12 +4525,169 @@ persistence-логіки.
 
 #### NestJS
 
+Idempotency означає, що повторення одного й того ж запиту багато разів
+призводить до того самого фінального стану системи, що й одноразове виконання.
+
+У REST API це критично для надійності при retry, network timeout і дубльованих
+клієнтських відправках.
+
+#### HTTP-семантика і idempotency
+
+1. **Зазвичай ідемпотентні за дизайном**
+   `GET`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`.
+
+2. **Не ідемпотентний за замовчуванням**
+   `POST` (часто створює новий ресурс при кожному виклику).
+
+#### Чому idempotency важливий
+
+1. Безпечні клієнтські повтори після timeout.
+2. Захист від дублю дій (подвійний платіж/замовлення).
+3. Краща стійкість у distributed systems і at-least-once delivery сценаріях.
+
+#### Як забезпечити idempotency на практиці
+
+1. **Idempotency key патерн (для POST)**
+   Клієнт надсилає унікальний ключ (наприклад, у header `Idempotency-Key`).
+   Сервер зберігає ключ + fingerprint запиту + відповідь.
+   Повтор із тим самим ключем повертає первинний результат замість повторного
+   виконання дії.
+
+2. **Обмеження на рівні БД**
+   Впроваджуйте унікальність для бізнес-ідентифікаторів
+   (`externalPaymentId`, `orderReference` тощо).
+
+3. **Upsert/compare-and-set патерни**
+   Використовуйте детерміновані write-операції там, де можливо.
+
+4. **Транзакційна обробка**
+   Захищайте багатокрокові записи від часткового дублювання.
+
+#### Нарис реалізації в NestJS
+
+1. Interceptor/guard перевіряє `Idempotency-Key`.
+2. Обчислюється fingerprint (route + user + hash payload).
+3. Пошук idempotency-запису:
+   1. Якщо completed -> повернути збережену відповідь.
+   2. Якщо in-progress -> повернути conflict/retry-later політику.
+   3. Якщо відсутній -> зарезервувати ключ і виконати handler.
+4. Атомарно зберегти фінальну відповідь і повернути її.
+
+#### Мінімальний концептуальний flow
+
+```text
+Request -> Idempotency middleware/interceptor
+        -> key exists with completed response? return cached response
+        -> else execute use case
+        -> persist outcome by key
+        -> return response
+```
+
+#### Поширені помилки
+
+1. Повторне використання ключа для іншого payload (має детектитись і відхилятись).
+2. Зберігання ключів без TTL/cleanup.
+3. Відсутність scope ключа за tenant/user там, де це потрібно.
+4. Повернення різних відповідей на retry з тим самим ключем.
+
+#### Практична рекомендація
+
+Для всіх money/order/subscription endpoint-ів застосовуйте idempotency keys +
+unique constraints у БД. Це дає захист від дублювання і на рівні застосунку, і
+на рівні persistence.
+
 </details>
 
 <details>
 <summary>57. Як реалізувати rate limiting у NestJS? (@nestjs/throttler)</summary>
 
 #### NestJS
+
+Rate limiting контролює, скільки запитів клієнт може зробити за певний проміжок
+часу. У NestJS стандартне рішення - `@nestjs/throttler`.
+
+#### Навіщо потрібен rate limiting
+
+1. Захищає API від зловживань і brute-force спроб.
+2. Зменшує випадкове перевантаження від "шумних" клієнтів.
+3. Покращує справедливий розподіл ресурсів між users/tenants.
+4. Додає стійкість до того, як трафік дійде до дорогих залежностей.
+
+#### Крок 1: встановіть і налаштуйте модуль
+
+```ts
+import { Module } from '@nestjs/common';
+import { ThrottlerModule } from '@nestjs/throttler';
+
+@Module({
+  imports: [
+    ThrottlerModule.forRoot([
+      {
+        ttl: 60_000, // 60 секунд
+        limit: 100,  // 100 запитів за вікно
+      },
+    ]),
+  ],
+})
+export class AppModule {}
+```
+
+#### Крок 2: підключіть глобальний guard
+
+```ts
+import { ThrottlerGuard } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+
+providers: [
+  {
+    provide: APP_GUARD,
+    useClass: ThrottlerGuard,
+  },
+];
+```
+
+Тепер усі маршрути мають rate limit за замовчуванням.
+
+#### Крок 3: кастомізуйте ліміти на рівні route/controller
+
+Жорсткіший ліміт:
+
+```ts
+@Throttle({ default: { limit: 5, ttl: 60_000 } })
+@Post('login')
+login() {}
+```
+
+Пропустити ліміт для health endpoint:
+
+```ts
+@SkipThrottle()
+@Get('health')
+health() {}
+```
+
+#### Стратегія ключа (кого саме лімітуємо)
+
+За замовчуванням це зазвичай IP клієнта. У реальних системах часто потрібні:
+1. ліміти за user ID (після auth),
+2. ліміти за tenant/API key,
+3. окремі політики для груп маршрутів.
+
+Для цього можна розширити логіку guard/tracker під кастомні ключі.
+
+#### Нотатка для distributed deployment
+
+У multi-instance середовищі in-memory storage недостатньо для строгих глобальних
+лімітів. Потрібен shared storage adapter (наприклад, Redis-backed throttling
+store), щоб ліміти були консистентні між репліками.
+
+#### Практичні best practices
+
+1. Робіть жорсткіші ліміти для auth/reset/token endpoint-ів.
+2. Повертайте зрозумілі `429 Too Many Requests` відповіді.
+3. За можливості віддавайте retry-метадані (`Retry-After`).
+4. Моніторте throttle hits по маршрутах/клієнтах і тюньте ліміти.
+5. Комбінуйте з WAF/reverse-proxy rate limiting для багатошарового захисту.
 
 </details>
 
@@ -3712,12 +4696,172 @@ persistence-логіки.
 
 #### NestJS
 
+Request tracing означає додавання унікального `requestId` до кожного вхідного
+запиту і його подальшу передачу через логи, відповіді та downstream-виклики.
+
+Це критично для дебагу distributed systems і кореляції подій між сервісами.
+
+#### Цілі request tracing
+
+1. Корелювати всі логи одного запиту.
+2. Відстежувати збої через middleware/guards/services/DB/external APIs.
+3. Повертати ідентифікатор запиту клієнтам/команді підтримки.
+
+#### Типовий патерн реалізації
+
+1. Middleware читає наявний header (`x-request-id`) або генерує новий UUID.
+2. Зберігає ID в об'єкті request.
+3. Додає ID у response headers.
+4. Logger автоматично включає `requestId` у кожен лог-запис.
+
+#### Приклад middleware
+
+```ts
+import { Injectable, NestMiddleware } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { Request, Response, NextFunction } from 'express';
+
+@Injectable()
+export class RequestIdMiddleware implements NestMiddleware {
+  use(req: Request, res: Response, next: NextFunction) {
+    const incoming = req.header('x-request-id');
+    const requestId = incoming && incoming.trim() ? incoming : randomUUID();
+
+    (req as any).requestId = requestId;
+    res.setHeader('x-request-id', requestId);
+
+    next();
+  }
+}
+```
+
+Підключіть middleware глобально в `AppModule.configure(...)`.
+
+#### Інтеграція з логуванням
+
+1. Додавайте `requestId` у структуровані логи з interceptors/services.
+2. Використовуйте централізовану logger-абстракцію, щоб кожен рядок логів мав
+   correlation-поля.
+
+Приклад interceptor-а (таймінг + requestId):
+
+```ts
+const req = context.switchToHttp().getRequest();
+const requestId = req.requestId;
+this.logger.log({ msg: 'request.start', requestId, path: req.url });
+```
+
+#### Поширення async context (advanced)
+
+Для глибоких service-layer і фонових async-ланцюгів використовуйте
+`AsyncLocalStorage` (або CLS-модуль), щоб мати доступ до `requestId` без ручної
+передачі через кожен метод.
+
+#### Downstream propagation
+
+1. Проксіюйте `x-request-id` у вихідні HTTP-виклики.
+2. Додавайте request ID у metadata повідомлень для queues/events.
+3. Мапте його до trace/span ID, якщо використовуєте OpenTelemetry.
+
+#### Best practices
+
+1. Приймайте upstream request ID від trusted gateways.
+2. Генеруйте ID на сервері, якщо його немає.
+3. Повертайте ID у кожній error-відповіді для support-діагностики.
+4. Тримайте єдину назву заголовка в усіх сервісах.
+5. Використовуйте requestId як correlation metadata, не як security token.
+
 </details>
 
 <details>
 <summary>59. Як обробити multipart/form-data і завантаження файлів у NestJS?</summary>
 
 #### NestJS
+
+У NestJS (на платформі Express) завантаження файлів зазвичай реалізується через
+Multer за допомогою interceptor-ів із `@nestjs/platform-express`.
+
+`multipart/form-data` використовується, коли запит містить файли (і, за потреби,
+додаткові поля).
+
+#### Основні будівельні блоки
+
+1. `FileInterceptor()` для одного файлу.
+2. `FilesInterceptor()` для кількох файлів в одному полі.
+3. `FileFieldsInterceptor()` для кількох іменованих file-полів.
+4. `@UploadedFile()` / `@UploadedFiles()` для доступу до розпарсених файлів.
+
+#### Приклад завантаження одного файлу
+
+```ts
+import {
+  BadRequestException,
+  Controller,
+  Post,
+  UploadedFile,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
+import { extname } from 'path';
+
+@Controller('files')
+export class FilesController {
+  @Post('avatar')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: diskStorage({
+        destination: './uploads',
+        filename: (_req, file, cb) => {
+          const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+          cb(null, `${unique}${extname(file.originalname)}`);
+        },
+      }),
+      limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+      fileFilter: (_req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        if (!allowed.includes(file.mimetype)) {
+          return cb(new BadRequestException('Invalid file type') as any, false);
+        }
+        cb(null, true);
+      },
+    }),
+  )
+  uploadAvatar(@UploadedFile() file: Express.Multer.File) {
+    return { filename: file.filename, size: file.size };
+  }
+}
+```
+
+#### Обробка кількох файлів
+
+1. Одне поле:
+   `@UseInterceptors(FilesInterceptor('files', 10))`
+
+2. Іменовані поля:
+   `@UseInterceptors(FileFieldsInterceptor([{ name: 'avatar', maxCount: 1 }, ...]))`
+
+#### Валідація і вимоги безпеки
+
+1. Обмежуйте максимальний розмір файлів.
+2. Перевіряйте MIME-тип і (бажано) фактичну сигнатуру файлу.
+3. Санітизуйте назви файлів і не довіряйте клієнтським іменам.
+4. Зберігайте файли поза executable/static чутливими шляхами.
+5. Для ризикових доменів додавайте malware-сканування.
+
+#### Стратегії зберігання
+
+1. Локальний диск (простий варіант для dev/невеликих деплоїв).
+2. Object storage (S3/GCS/MinIO) для масштабованого production.
+3. Зберігання в БД - лише для спеціальних кейсів (зазвичай некраще для великих бінарних файлів).
+
+#### Production best practices
+
+1. Для великих файлів віддавайте перевагу direct-to-object-storage upload.
+2. У БД зберігайте метадані (owner, key, mime, size, checksum).
+3. Використовуйте signed URL для контролю доступу на upload/download.
+4. Додавайте auth + rate limits на upload endpoint-и.
+5. Впроваджуйте retention/cleanup політики.
 
 </details>
 
@@ -3726,12 +4870,155 @@ persistence-логіки.
 
 #### NestJS
 
+Compression зменшує розмір response payload і покращує мережеву продуктивність,
+особливо для JSON/text-heavy API.
+
+У NestJS (адаптер Express) gzip/brotli зазвичай вмикається через compression
+middleware.
+
+#### Базове налаштування (Express)
+
+1. Встановіть `compression`.
+2. Зареєструйте middleware у `main.ts`.
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import compression from 'compression';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.use(
+    compression({
+      threshold: 1024, // стискати відповіді > 1KB
+    }),
+  );
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+Header `Accept-Encoding` від клієнта визначає вибір алгоритму
+(`br`, `gzip` тощо, залежно від підтримки runtime/proxy).
+
+#### Де зазвичай відбувається brotli
+
+1. Рівень застосунку (Node middleware/runtime support).
+2. Reverse proxy/CDN (Nginx, Cloudflare, Vercel тощо).
+
+У багатьох production-сценаріях proxy/CDN стискає ефективніше, ніж процес
+застосунку.
+
+#### Що стискати
+
+1. JSON-відповіді
+2. Text/HTML/CSS/JS
+3. GraphQL-відповіді
+
+#### Що не стискати
+
+1. Уже стиснуті формати (`.zip`, `.jpg`, `.png`, `.mp4`, `.pdf`)
+2. Дуже малі payload (overhead стискання може бути вищим за користь)
+
+#### Operational best practices
+
+1. Використовуйте threshold, щоб пропускати дуже малі відповіді.
+2. Переконайтесь, що cache/proxy поважає `Vary: Accept-Encoding`.
+3. Вимірюйте CPU overhead проти економії bandwidth.
+4. Для high-traffic систем віддавайте перевагу стисненню на proxy/CDN.
+5. Враховуйте TLS + compression ризики в чутливих контекстах (сьогодні рідко,
+   але дотримуйтесь рекомендацій платформи).
+
+#### Нотатка для Fastify
+
+Якщо використовуєте Fastify adapter, підключайте відповідний Fastify compression
+plugin замість Express middleware.
+
+#### Практична рекомендація
+
+Вмикайте compression за замовчуванням для API-відповідей, а далі тюньте threshold
+і місце стискання (app vs edge/proxy) за реальним трафіком і CPU-профілем.
+
 </details>
 
 <details>
 <summary>61. Як реалізувати helmet і які HTTP-заголовки він встановлює?</summary>
 
 #### NestJS
+
+Helmet - це security middleware, який встановлює захисні HTTP-заголовки для
+зменшення поверхні типових веб-атак (XSS, clickjacking, MIME sniffing, витоки
+даних через referrer тощо).
+
+У NestJS (Express adapter) його зазвичай підключають глобально в `main.ts`.
+
+#### Базове налаштування
+
+1. Встановіть `helmet`.
+2. Зареєструйте як middleware.
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import helmet from 'helmet';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.use(
+    helmet({
+      // Налаштуйте CSP/HSTS тощо під потреби середовища
+    }),
+  );
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+#### Типові заголовки, які встановлює Helmet (залежить від версії/конфігу)
+
+1. `Content-Security-Policy` (CSP)
+2. `Cross-Origin-Opener-Policy`
+3. `Cross-Origin-Resource-Policy`
+4. `Origin-Agent-Cluster`
+5. `Referrer-Policy`
+6. `Strict-Transport-Security` (HSTS, коли доречний HTTPS-контекст)
+7. `X-Content-Type-Options: nosniff`
+8. `X-DNS-Prefetch-Control`
+9. `X-Download-Options` (legacy-захист для IE)
+10. `X-Frame-Options` (захист від clickjacking)
+11. `X-Permitted-Cross-Domain-Policies`
+12. `X-XSS-Protection` (legacy-поведінка; сучасні браузери покладаються на CSP)
+
+Точні дефолти можуть відрізнятися залежно від версії Helmet і runtime-середовища.
+
+#### Практичні нотатки з конфігурації
+
+1. **Тюнінг CSP критично важливий**
+   Строгий CSP підвищує безпеку, але без налаштування може ламати scripts/styles.
+
+2. **HSTS лише на HTTPS**
+   Увімкнюйте обережно на production-доменах; уникайте випадкового lock-in на локалі/dev.
+
+3. **CORS + Helmet**
+   Вони вирішують різні задачі; налаштовуйте обидва явно.
+
+4. **Враховуйте reverse proxy**
+   Переконайтесь, що trusted proxy/HTTPS termination налаштовані коректно для
+   HSTS та загальної security-поведінки.
+
+#### Типовий production-патерн
+
+1. Увімкнути Helmet глобально.
+2. Кастомізувати CSP directives під frontend/API поведінку.
+3. Тримати окремі профілі конфігурації для dev і production.
+4. Перевіряти заголовки через integration-тести та security-скани.
+
+#### Правило практики
+
+Helmet дає сильний базовий hardening, але не є повною безпекою. Комбінуйте його
+з auth, валідацією, rate limits, secure cookies і dependency hygiene.
 
 </details>
 
@@ -3740,12 +5027,173 @@ persistence-логіки.
 
 #### NestJS
 
+OWASP Top-ризики - це поширені класи веб-уразливостей. У NestJS захист
+реалізується шарово: валідація, auth, безпечні дефолти, моніторинг та
+інфраструктурний hardening.
+
+#### Основні OWASP-ризики та захисти в контексті NestJS
+
+1. **Broken Access Control**
+   1. Використовуйте Guards для authz (`RolesGuard`, policy/ABAC guards).
+   2. Перевіряйте ownership при доступі до ресурсів.
+   3. Застосовуйте deny-by-default; уникайте неявного доступу.
+
+2. **Cryptographic Failures**
+   1. Використовуйте HTTPS всюди.
+   2. Хешуйте паролі надійними алгоритмами (argon2/bcrypt із коректною cost).
+   3. Зберігайте секрети в secret manager, не в коді.
+   4. Шифруйте чутливі дані at rest, коли це потрібно.
+
+3. **Injection (SQL/NoSQL/Command)**
+   1. Використовуйте parameterized ORM-запити (TypeORM/Prisma).
+   2. Валідовуйте/whitelist-іть input через DTO + `ValidationPipe`.
+   3. Уникайте raw-запитів і shell-команд, зібраних рядком із user input.
+
+4. **Insecure Design**
+   1. Проводьте threat modeling для критичних флоу (auth, платежі, адмінка).
+   2. Закладайте idempotency, rate limits і anti-abuse механіки на етапі дизайну.
+   3. Дотримуйтесь least privilege в архітектурних межах.
+
+5. **Security Misconfiguration**
+   1. Увімкніть Helmet і строгий CORS.
+   2. Вимкніть debug-дефолти у production.
+   3. Тримайте production-середовище ізольованим і жорстко налаштованим.
+
+6. **Vulnerable and Outdated Components**
+   1. Регулярно оновлюйте залежності.
+   2. Запускайте SCA-скани в CI (`npm audit`, Snyk, Dependabot тощо).
+   3. Видаляйте невикористані пакети.
+
+7. **Identification and Authentication Failures**
+   1. Використовуйте short-lived access token + ротацію refresh token.
+   2. Додавайте MFA для high-risk акаунтів.
+   3. Забезпечуйте безпечну роботу з cookie/token, lockout/rate-limit для login endpoint-ів.
+
+8. **Software and Data Integrity Failures**
+   1. Використовуйте підписані артефакти та довірений CI/CD pipeline.
+   2. Перевіряйте сторонні джерела і pin-іть версії.
+   3. Контролюйте зміни конфігурації та процеси approve релізів.
+
+9. **Security Logging and Monitoring Failures**
+   1. Впроваджуйте структуровані логи з requestId/userId/action/outcome.
+   2. Налаштуйте алерти на auth-аномалії та сплески помилок.
+   3. Зберігайте stack traces у логах, а не у відповідях клієнту.
+
+10. **Server-Side Request Forgery (SSRF)**
+   1. Обмежуйте outbound network destinations.
+   2. Валідовуйте й allowlist-іть зовнішні URL.
+   3. Блокуйте internal metadata IP-діапазони.
+
+#### Базовий NestJS checklist
+
+1. Глобальний `ValidationPipe` (`whitelist`, `forbidNonWhitelisted`, `transform`).
+2. Глобальний exception filter із безпечними error-відповідями.
+3. Auth + authorization guards на захищених маршрутах.
+4. Rate limiting (`@nestjs/throttler`) на чутливих endpoint-ах.
+5. Helmet + строгий CORS-конфіг.
+6. Безпечний конфіг із валідацією на старті (Joi/Zod).
+7. Dependency/security scanning у CI.
+
+#### Практичний висновок
+
+Безпека - це не один пакет. У NestJS сильна security-позиція досягається
+послідовним defense-in-depth на рівні коду, конфігурації, інфраструктури й
+операцій.
+
 </details>
 
 <details>
 <summary>63. Як використовувати HttpModule (axios) у NestJS для запитів до зовнішніх API?</summary>
 
 #### NestJS
+
+У NestJS зовнішні HTTP-виклики зазвичай виконуються через `HttpModule` з
+`@nestjs/axios`, який обгортає Axios і інтегрується з DI.
+
+#### Навіщо використовувати `HttpModule`
+
+1. DI-friendly спільний HTTP-клієнт.
+2. Централізована конфігурація (base URL, timeout, headers).
+3. Зручне тестування/мокання.
+4. Вбудована інтеграція з RxJS (`Observable`-відповіді).
+
+#### Крок 1: зареєструйте `HttpModule`
+
+```ts
+import { Module } from '@nestjs/common';
+import { HttpModule } from '@nestjs/axios';
+
+@Module({
+  imports: [
+    HttpModule.register({
+      baseURL: 'https://api.example.com',
+      timeout: 5000,
+      maxRedirects: 3,
+    }),
+  ],
+})
+export class ExternalApiModule {}
+```
+
+Асинхронний варіант конфігурації:
+`HttpModule.registerAsync(...)` із `ConfigService`.
+
+#### Крок 2: інжектіть `HttpService` у провайдер
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
+
+@Injectable()
+export class ExternalUsersClient {
+  constructor(private readonly http: HttpService) {}
+
+  async getUser(id: string) {
+    const response = await firstValueFrom(
+      this.http.get(`/users/${id}`, {
+        headers: { 'x-service': 'nestjs-app' },
+      }),
+    );
+    return response.data;
+  }
+}
+```
+
+#### Патерн обробки помилок
+
+1. Перехоплюйте Axios-помилки і мапте їх у domain/app exceptions.
+2. Не віддавайте raw upstream-помилки напряму клієнтам API.
+
+```ts
+try {
+  const res = await firstValueFrom(this.http.get('/health'));
+  return res.data;
+} catch (e: any) {
+  const status = e?.response?.status;
+  throw new BadGatewayException(`Upstream error: ${status ?? 'unknown'}`);
+}
+```
+
+#### Production best practices
+
+1. Встановлюйте строгі timeout для всіх outbound-викликів.
+2. Додавайте retries/circuit breaker для нестабільних залежностей.
+3. Проксіюйте request/correlation ID в headers.
+4. Використовуйте типізовані response DTO/адаптери для зовнішніх контрактів.
+5. Інструментуйте latency, помилки та upstream status codes.
+
+#### Стратегія тестування
+
+1. Мокайте `HttpService` в unit-тестах.
+2. Для integration-тестів використовуйте mock servers (наприклад, nock/wiremock).
+3. Явно перевіряйте шляхи timeout/retry/error mapping.
+
+#### Практичний висновок
+
+Сприймайте зовнішній HTTP як ненадійний I/O: централізовано конфігуруйте
+`HttpModule`, обгортайте його в окремі client-сервіси і застосовуйте надійні
+політики timeout/retry/error.
 
 </details>
 
@@ -3754,6 +5202,96 @@ persistence-логіки.
 
 #### NestJS
 
+У NestJS Axios interceptors налаштовуються на інстансі `axiosRef`, який надає
+`HttpService` (`@nestjs/axios`). Це дозволяє застосувати глобальну поведінку для
+вихідних запитів: headers, логування, таймінги, auth-токени і нормалізацію
+помилок.
+
+#### Навіщо використовувати Axios interceptors
+
+1. Централізувати поведінку outbound HTTP.
+2. Уникнути повторення headers/auth логіки у кожному виклику.
+3. Додати консистентне request/response логування і метрики.
+4. Нормалізувати upstream-помилки в одному місці.
+
+#### Типовий патерн реалізації
+
+1. Створіть provider/service, який отримує `HttpService`.
+2. У lifecycle init модуля один раз зареєструйте request/response interceptors.
+3. Тримайте логіку interceptor-ів легкою та детермінованою.
+
+#### Приклад: глобальні outbound headers + логування
+
+```ts
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+
+@Injectable()
+export class HttpClientInterceptorSetup implements OnModuleInit {
+  private readonly logger = new Logger(HttpClientInterceptorSetup.name);
+
+  constructor(private readonly http: HttpService) {}
+
+  onModuleInit() {
+    const axios = this.http.axiosRef;
+
+    axios.interceptors.request.use((config) => {
+      const startedAt = Date.now();
+      (config as any).metadata = { startedAt };
+
+      config.headers = config.headers ?? {};
+      config.headers['x-service-name'] = 'nestjs-api';
+      config.headers['x-request-id'] = config.headers['x-request-id'] ?? 'generated-or-propagated-id';
+
+      this.logger.debug(`HTTP -> ${config.method?.toUpperCase()} ${config.url}`);
+      return config;
+    });
+
+    axios.interceptors.response.use(
+      (response) => {
+        const startedAt = (response.config as any).metadata?.startedAt ?? Date.now();
+        const duration = Date.now() - startedAt;
+        this.logger.debug(
+          `HTTP <- ${response.status} ${response.config.method?.toUpperCase()} ${response.config.url} (${duration}ms)`,
+        );
+        return response;
+      },
+      (error) => {
+        const cfg = error.config ?? {};
+        const status = error.response?.status;
+        this.logger.warn(
+          `HTTP !! ${cfg.method?.toUpperCase()} ${cfg.url} status=${status ?? 'NO_RESPONSE'}`,
+        );
+        return Promise.reject(error);
+      },
+    );
+  }
+}
+```
+
+Зареєструйте цей provider у модулі, який імпортує `HttpModule`.
+
+#### Важливі production-нотатки
+
+1. Переконайтесь, що interceptors реєструються один раз (уникайте дублювань при
+   hot reload/module re-init).
+2. Проксіюйте correlation/request ID з inbound request context.
+3. Редагуйте/маскуйте секрети (Authorization, API keys) у логах.
+4. Тримайте timeout/retry/circuit-breaker стратегію явною (interceptors самі по
+   собі не є повноцінним resilience-шаром).
+
+#### Поширені use-case
+
+1. Інжекція auth-токенів із `ConfigService` або token providers.
+2. Додавання tenant/context headers для downstream-сервісів.
+3. Стандартизація error-об'єктів перед повторним throw.
+4. Відправка metrics/traces у observability-системи.
+
+#### Практичний висновок
+
+Сприймайте Axios interceptors як outbound-аналог Nest middleware: одна точка
+для наскрізної політики HTTP-клієнта у всіх викликах зовнішніх API.
+
 </details>
 
 <details>
@@ -3761,12 +5299,169 @@ persistence-логіки.
 
 #### NestJS
 
+Коректна типізація відповідей зовнішнього API означає, що remote-дані
+розглядаються як **недовірені**, доки не пройдуть валідацію, навіть якщо ви
+використовуєте TypeScript для зручності розробки.
+
+#### Ключовий принцип
+
+1. Compile-time типи (`interface`/`type`) покращують DX.
+2. Runtime-валідація (Zod/class-validator/custom guards) гарантує безпеку.
+3. Потрібні обидва підходи разом, а не лише один.
+
+#### Рекомендований патерн
+
+1. Опишіть response DTO/type для очікуваної структури.
+2. Отримайте дані через типізований HTTP-виклик.
+3. Провалідуйте/розпарсьте дані на boundary.
+4. Замапте у внутрішню domain-модель до бізнес-логіки.
+
+#### Приклад з `HttpService` + Zod
+
+```ts
+import { Injectable, BadGatewayException } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
+import { z } from 'zod';
+
+const ExternalUserSchema = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  status: z.enum(['active', 'blocked']),
+});
+
+type ExternalUser = z.infer<typeof ExternalUserSchema>;
+
+@Injectable()
+export class ExternalUsersClient {
+  constructor(private readonly http: HttpService) {}
+
+  async getUser(id: string): Promise<ExternalUser> {
+    const res = await firstValueFrom(this.http.get<unknown>(`/users/${id}`));
+    const parsed = ExternalUserSchema.safeParse(res.data);
+
+    if (!parsed.success) {
+      throw new BadGatewayException('Invalid upstream payload');
+    }
+
+    return parsed.data;
+  }
+}
+```
+
+#### Чому не варто покладатися лише на generics
+
+```ts
+this.http.get<MyType>(...)
+```
+
+Це лише підказує TypeScript, що ви *очікуєте*; реальний runtime payload від
+upstream-сервісу це не перевіряє.
+
+#### Практичні стратегії типізації
+
+1. Використовуйте окремі client-модулі для кожного зовнішнього API.
+2. Тримайте upstream DTO окремо від внутрішніх domain entities.
+3. Нормалізуйте/трансформуйте зовнішні enum-и та назви полів на boundary.
+4. Явно обробляйте nullable/optional поля (`null` з upstream трапляється часто).
+
+#### Best practices обробки помилок
+
+1. Розрізняйте transport-помилки (timeout, 5xx) і schema-помилки.
+2. Мапте обидва типи в стабільні внутрішні exceptions.
+3. Логуйте метадані upstream-відповідей для діагностики (без витоку секретів).
+
+#### Правило практики
+
+Типізуйте зовнішні відповіді двічі:
+1. статичним типом для code intelligence,
+2. runtime schema-валідацією для коректності й безпеки.
+
 </details>
 
 <details>
 <summary>66. Як реалізувати retry логіку для зовнішніх HTTP-запитів у NestJS?</summary>
 
 #### NestJS
+
+Retry-логіка допомагає обробляти тимчасові збої (timeouts, короткочасні 5xx,
+мережеві збої) під час викликів зовнішніх API.
+
+У NestJS retry зазвичай реалізують через RxJS-оператори на `HttpService` або
+через resilience-бібліотеки на межі client-сервісу.
+
+#### Коли retries доречні
+
+1. Timeout/network помилки.
+2. Тимчасові upstream 5xx.
+3. Rate-limit відповіді, коли сервер дає retry-підказки (`429` з `Retry-After`).
+
+#### Коли retries небезпечні
+
+1. Неідемпотентні операції без idempotency keys.
+2. Постійні помилки (`400`, `401`, `403`, validation failures).
+3. Великі retry-штормові хвилі під час outage upstream.
+
+#### Базовий retry з RxJS
+
+```ts
+import { Injectable, BadGatewayException } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom, throwError, timer } from 'rxjs';
+import { mergeMap, retryWhen } from 'rxjs/operators';
+
+@Injectable()
+export class ExternalApiClient {
+  constructor(private readonly http: HttpService) {}
+
+  async getData() {
+    const request$ = this.http.get('/resource').pipe(
+      retryWhen(errors =>
+        errors.pipe(
+          mergeMap((error, attempt) => {
+            const status = error?.response?.status;
+            const retryable = !status || status >= 500 || status === 429;
+            const maxRetries = 3;
+
+            if (!retryable || attempt >= maxRetries) {
+              return throwError(() => error);
+            }
+
+            const backoffMs = 200 * Math.pow(2, attempt); // 200, 400, 800
+            return timer(backoffMs);
+          }),
+        ),
+      ),
+    );
+
+    try {
+      const res = await firstValueFrom(request$);
+      return res.data;
+    } catch {
+      throw new BadGatewayException('Upstream service unavailable');
+    }
+  }
+}
+```
+
+#### Рекомендована retry-політика
+
+1. Використовуйте exponential backoff.
+2. Додавайте jitter, щоб уникати синхронізованих retry-сплесків.
+3. Жорстко обмежуйте максимальну кількість спроб.
+4. Повторюйте лише idempotent-операції або idempotency-захищені записи.
+
+#### Поєднуйте retries із захисними механізмами
+
+1. Глобальний timeout на запит.
+2. Circuit breaker для тривалих відмов.
+3. Rate limiting і bulkheads для outbound-клієнтів.
+4. Централізовані метрики: кількість retry, фінальний failure rate, вплив на latency.
+
+#### Практичне правило
+
+Retries мають підвищувати надійність, а не приховувати outage. Робіть їх
+вибірковими, обмеженими й observability-friendly.
 
 </details>
 
@@ -3782,6 +5477,94 @@ persistence-логіки.
 
 #### NestJS
 
+Кешування зберігає попередньо обчислені/часто запитувані дані, щоб зменшити
+latency і навантаження на backend. У NestJS найпоширеніші варіанти - in-memory
+cache і Redis cache.
+
+#### In-memory vs Redis
+
+1. **In-memory cache**
+   Дані зберігаються в пам'яті одного процесу застосунку.
+
+2. **Redis cache**
+   Зовнішній shared cache-сервіс, доступний усім інстансам застосунку.
+
+#### Коли використовувати in-memory cache
+
+1. Single-instance застосунки або локальна розробка.
+2. Невеликі, короткоживучі кешовані значення.
+3. Наднизька latency для локальних читань.
+
+Обмеження:
+1. Не шариться між репліками.
+2. Втрачається при рестарті/деплої процесу.
+3. Memory pressure впливає на сам процес застосунку.
+
+#### Коли використовувати Redis cache
+
+1. Multi-instance/distributed деплои.
+2. Shared cache між сервісами.
+3. Потрібна централізована поведінка TTL/invalidation.
+4. Вищі вимоги до надійності та observability.
+
+Компроміс:
+1. Додається невелика мережна затримка.
+
+#### Варіанти реалізації в NestJS
+
+1. `CacheModule` + cache-manager adapters.
+2. Ручний Redis client для розширених патернів.
+3. `CacheInterceptor` для response-level кешування на вибраних endpoint-ах.
+
+#### Концептуальний приклад `CacheModule`
+
+In-memory:
+
+```ts
+CacheModule.register({
+  ttl: 30_000,
+  max: 500,
+});
+```
+
+Redis (adapter-specific конфіг):
+
+```ts
+CacheModule.registerAsync({
+  useFactory: () => ({
+    store: /* redis store adapter */,
+    url: process.env.REDIS_URL,
+    ttl: 60_000,
+  }),
+});
+```
+
+#### Що кешувати
+
+1. Read-heavy дані, що рідко змінюються.
+2. Дорогі обчислювані агрегати.
+3. Відповіді зовнішніх API з чітко допустимою застарілістю.
+
+#### Що не варто кешувати бездумно
+
+1. Дуже волатильні дані без плану invalidation.
+2. Security-sensitive per-user дані без scoped keys.
+3. Write-critical шляхи, де застарілі читання неприйнятні.
+
+#### Ключові практики дизайну
+
+1. Використовуйте явне іменування ключів (`user:{id}`, `catalog:v2:{region}`).
+2. Задавайте TTL усвідомлено для кожного типу даних.
+3. Додавайте cache-aside патерн:
+   read -> miss -> load source -> set cache -> return.
+4. Плануйте invalidation на writes/events.
+5. Моніторте hit ratio, evictions і вплив stale-read.
+
+#### Правило практики
+
+In-memory підходить для простих single-node кейсів. Для production із
+кількома інстансами або shared-state потребами переходьте на Redis-backed cache.
+
 </details>
 
 <details>
@@ -3795,6 +5578,67 @@ persistence-логіки.
 <summary>70. Коли в NestJS варто використовувати Observables замість Promise?</summary>
 
 #### NestJS
+
+Використовуйте Observables у NestJS, коли потрібні **стріми, скасування,
+композиція кількох async-подій або reactive-оператори**. Promises краще підходять
+для простих одноразових async-операцій.
+
+#### Ключова різниця
+
+1. **Promise**
+   Одне майбутнє значення (або помилка), резолвиться один раз.
+
+2. **Observable**
+   Лінивий стрім 0..N значень у часі, з потужними RxJS-операторами та
+   підтримкою скасування.
+
+#### Коли Observables кращий вибір
+
+1. **Streaming-сценарії**
+   Server-Sent Events, websocket-подібні флоу, chunked-відповіді.
+
+2. **Композиція кількох async-джерел**
+   Комбінування таймерів, HTTP-викликів, user events і retry через оператори.
+
+3. **Складна retry/backoff/circuit поведінка**
+   RxJS-оператори (`retryWhen`, `timeout`, `catchError`, `switchMap` тощо).
+
+4. **Скасування виконання**
+   `unsubscribe` зупиняє роботу і вивільняє ресурси.
+
+5. **Особливості екосистеми Nest**
+   Interceptors і `HttpService` природно повертають Observables.
+
+#### Коли краще Promise
+
+1. Один запит -> одна відповідь (DB/API виклик).
+2. Проста service-логіка через `async/await`.
+3. Команда не використовує глибоко reactive-підхід.
+
+#### Практичні приклади в NestJS
+
+1. `HttpService.get(...)` повертає `Observable<AxiosResponse<T>>`.
+2. SSE endpoint-и часто повертають `Observable<MessageEvent>`.
+3. Message patterns у мікросервісах можуть працювати як reactive-стріми.
+
+#### Interop-патерн
+
+Якщо код пишеться в `async/await`, але ви отримали Observable:
+
+```ts
+const response = await firstValueFrom(this.http.get('/users'));
+```
+
+Якщо потрібне лише одне значення зі стріму, конвертуйте явно
+(`firstValueFrom` або `lastValueFrom`) і тримайте межі чіткими.
+
+#### Практичне правило вибору
+
+1. Потрібне одне значення один раз -> Promise (`async/await`).
+2. Потрібні стріми/retry-композиція/скасування -> Observable.
+
+По можливості тримайте один стиль на межі модуля, щоб не створювати зайву
+асинхронну складність.
 
 </details>
 
@@ -3810,6 +5654,68 @@ persistence-логіки.
 
 #### NestJS
 
+NestJS працює на Node.js event loop. Якщо блокувати loop CPU-важкими або
+синхронними операціями, затримка зростає для всіх одночасних запитів.
+
+#### Що блокує event loop
+
+1. Важкі синхронні CPU-задачі (хешування великих payload, обробка image/video).
+2. Великі синхронні цикли JSON parse/stringify.
+3. Синхронні filesystem API (`fs.readFileSync` тощо) в request path.
+4. Довгі tight loops без yield.
+5. Дорогі regex/backtracking і неефективні алгоритми.
+
+#### Практичні стратегії уникнення блокування
+
+1. **Віддавайте перевагу async I/O API**
+   Використовуйте неблокуючі filesystem/network/DB операції.
+
+2. **Виносьте CPU-heavy роботу з request thread**
+   1. Worker threads (`worker_threads`)
+   2. Background jobs/queues (BullMQ, RabbitMQ тощо)
+   3. Окремі processing-сервіси
+
+3. **Використовуйте streaming для великих payload**
+   Уникайте буферизації великих файлів/об'єктів у пам'яті.
+
+4. **Пагінуйте та діліть роботу на чанки**
+   Обробляйте великі набори даних батчами замість одного великого sync-проходу.
+
+5. **Кешуйте дорогі обчислення**
+   Повторно використовуйте результати, де можливо.
+
+#### Архітектурні патерни NestJS
+
+1. Тримайте контролери "тонкими"; важкі задачі делегуйте в async workers.
+2. Використовуйте черги для email/PDF/report/media conversion задач.
+3. Налаштовуйте timeout і backpressure-політики для зовнішніх викликів.
+4. Додавайте rate limiting на дорогих endpoint-ах.
+
+#### Сигнали блокування event loop
+
+1. Ріст p95/p99 latency навіть при помірному трафіку.
+2. Низький CPU idle при слабкому throughput.
+3. Затримані таймери та повільні health checks.
+4. Зростання event loop lag метрик.
+
+#### Корисні operational інструменти
+
+1. Моніторинг event loop lag (`perf_hooks`, APM-інструменти).
+2. CPU profiling/flamegraphs для hot paths.
+3. Дашборди latency та payload-size на рівні endpoint-ів.
+
+#### Поширені помилки
+
+1. Синхронні crypto/compression операції у request handlers.
+2. Генерація великих звітів inline у HTTP-запиті.
+3. Читання великих файлів у пам'ять замість streaming.
+4. Ігнорування algorithmic complexity у циклах по великих масивах.
+
+#### Правило практики
+
+Request thread має оркеструвати, а не важко обчислювати. Тримайте його
+неблокуючим і делегуйте дорогі задачі в async-інфраструктуру.
+
 </details>
 
 <details>
@@ -3823,6 +5729,85 @@ persistence-логіки.
 <summary>74. Як використовувати cluster mode у Node.js разом з NestJS для масштабування?</summary>
 
 #### NestJS
+
+Cluster mode запускає кілька worker-процесів Node.js на одній машині, що дає
+NestJS-застосунку змогу використовувати кілька CPU-ядер замість одного event loop.
+
+#### Навіщо використовувати cluster mode
+
+1. Краще використання CPU на multi-core серверах.
+2. Вищий throughput для CPU/mixed workload.
+3. Ізоляція на рівні процесів (падіння одного воркера не зупиняє всі).
+
+#### Базова ідея налаштування cluster
+
+1. Primary-процес форкає `N` worker-ів (`N` зазвичай = кількість CPU-ядер).
+2. Кожен worker піднімає Nest-застосунок на тому ж порту.
+3. Node розподіляє вхідні з'єднання між воркерами.
+
+#### Приклад bootstrap (концептуально)
+
+```ts
+import cluster from 'cluster';
+import { cpus } from 'os';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrapWorker() {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(3000);
+}
+
+if (cluster.isPrimary) {
+  const workerCount = cpus().length;
+  for (let i = 0; i < workerCount; i++) cluster.fork();
+
+  cluster.on('exit', () => {
+    cluster.fork(); // naive auto-restart
+  });
+} else {
+  bootstrapWorker();
+}
+```
+
+#### Важливі production-моменти
+
+1. **Statelessness**
+   In-memory стан окремий для кожного воркера і не шариться.
+   Для shared sessions/cache/locks використовуйте Redis/DB.
+
+2. **WebSockets**
+   Потрібні sticky sessions або зовнішній pub/sub adapter для консистентності
+   між воркерами.
+
+3. **Rate limiting/cache**
+   In-memory реалізації стають неконсистентними між воркерами.
+   Краще використовувати Redis-backed stores.
+
+4. **Graceful shutdown**
+   Обробляйте SIGTERM/SIGINT і коректно дренуйте з'єднання в кожному воркері.
+
+5. **Observability**
+   Додавайте worker ID/process ID у логи та метрики.
+
+#### Cluster vs containers/orchestrators
+
+1. Cluster масштабує вертикально в межах одного хоста.
+2. Kubernetes/PM2/systemd replicas масштабує горизонтально між хостами.
+3. Багато команд спочатку покладаються на горизонтальне масштабування, а cluster
+   додають за потреби.
+
+#### Коли cluster mode доречний
+
+1. Bare-metal/VM деплои з multi-core CPU.
+2. Потрібен додатковий throughput без негайних infra-змін.
+3. Застосунок переважно stateless і готовий до multi-process поведінки.
+
+#### Правило практики
+
+Cluster може підвищити throughput на одному хості, але це не заміна
+distributed-архітектурі. Поєднуйте його із зовнішнім зберіганням стану та
+надійним process management.
 
 </details>
 
@@ -3838,6 +5823,67 @@ persistence-логіки.
 
 #### NestJS
 
+`EventEmitter` у NestJS (`@nestjs/event-emitter`) - це in-process pub/sub
+механізм для внутрішньої комунікації між модулями. Він швидкий і простий, але
+не забезпечує надійне збереження подій при падінні/перезапуску процесу.
+
+Черги Bull/BullMQ - це персистентні системи обробки job-ів (зазвичай на Redis),
+призначені для фонового виконання, retry і надійності.
+
+#### Ключова різниця
+
+1. **EventEmitter**
+   1. In-memory, у межах одного процесу.
+   2. Fire-and-forget модульні події.
+   3. Без durable persistence за замовчуванням.
+
+2. **Bull/BullMQ**
+   1. Персистентне зберігання черги (Redis).
+   2. Job-и обробляються фоновими воркерами.
+   3. Є retries, delays, backoff, concurrency і monitoring.
+
+#### Коли використовувати EventEmitter
+
+1. Внутрішні domain events в межах одного інстансу сервісу.
+2. Легкі side effects (тригер audit log, сигнал invalidation кешу).
+3. Некритичне async-розв'язування компонентів, де допустима епізодична втрата події.
+
+#### Коли використовувати Bull/BullMQ
+
+1. Критичні задачі, які мають переживати рестарти.
+2. Довгі/важкі job-и (email, звіти, обробка медіа).
+3. Потрібні retry/backoff і dead-letter обробка.
+4. Потрібне згладжування навантаження і контроль concurrency.
+
+#### Порівняння моделі надійності
+
+1. **EventEmitter**
+   Якщо застосунок впав після emit і до виконання handler-а, подія може
+   загубитись.
+
+2. **Queue**
+   Job збережений персистентно; воркер може відновити обробку пізніше з retry-політиками.
+
+#### Компроміс latency і складності
+
+1. EventEmitter:
+   Нижча latency, нижча операційна складність.
+
+2. Queue:
+   Трохи вища latency і складність інфраструктури, зате значно вища надійність.
+
+#### Практичний патерн у NestJS
+
+1. Емітьте локальні domain events для миттєвих некритичних реакцій.
+2. Ставте durable background jobs у чергу для важливої/дорогої роботи.
+3. Для міжсервісної інтеграції використовуйте message brokers/events, а не лише
+   in-process EventEmitter.
+
+#### Правило практики
+
+Якщо втрата події неприйнятна, використовуйте Bull/BullMQ (або broker-backed
+messaging), а не plain EventEmitter.
+
 </details>
 
 <details>
@@ -3852,6 +5898,104 @@ persistence-логіки.
 
 #### NestJS
 
+Фонові задачі в NestJS використовують, щоб винести важку або не термінову роботу
+з request/response шляху (email, звіти, обробка медіа, sync-задачі).
+
+Bull/BullMQ надають Redis-backed durable черги з retries, delays і контролем
+конкурентності воркерів.
+
+#### Типова архітектура
+
+1. API/сервіс швидко ставить job у чергу.
+2. Worker/processor асинхронно обробляє job.
+3. Стан job відстежується (`waiting`, `active`, `completed`, `failed`).
+
+#### Крок 1: зареєструйте queue module
+
+Налаштування модуля в стилі Bull:
+
+```ts
+import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bull';
+
+@Module({
+  imports: [
+    BullModule.forRoot({
+      redis: { host: '127.0.0.1', port: 6379 },
+    }),
+    BullModule.registerQueue({ name: 'emails' }),
+  ],
+})
+export class JobsModule {}
+```
+
+#### Крок 2: продюсинг job-ів
+
+```ts
+import { InjectQueue } from '@nestjs/bull';
+import { Injectable } from '@nestjs/common';
+import { Queue } from 'bull';
+
+@Injectable()
+export class NotificationsService {
+  constructor(@InjectQueue('emails') private readonly emailsQueue: Queue) {}
+
+  async enqueueWelcomeEmail(userId: string, email: string) {
+    await this.emailsQueue.add(
+      'send-welcome-email',
+      { userId, email },
+      {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: true,
+      },
+    );
+  }
+}
+```
+
+#### Крок 3: обробка job-ів у processor
+
+```ts
+import { Process, Processor } from '@nestjs/bull';
+import { Job } from 'bull';
+
+@Processor('emails')
+export class EmailsProcessor {
+  @Process('send-welcome-email')
+  async handleWelcome(job: Job<{ userId: string; email: string }>) {
+    // call provider/send email
+  }
+}
+```
+
+#### Нотатка про BullMQ
+
+BullMQ використовує новіші API (`Queue`, `Worker`, `QueueEvents`) і рекомендований
+для сучасних екосистем. Концептуальний флоу той самий:
+producer -> Redis queue -> worker.
+
+#### Production best practices
+
+1. Робіть job-и ідемпотентними (безпечними для retry).
+2. Явно задавайте attempts/backoff і політики обробки помилок.
+3. Використовуйте окремі worker-процеси для важких черг.
+4. Моніторте глибину черги, час обробки та failure rate.
+5. Впроваджуйте dead-letter/retry analysis workflow для poisoned jobs.
+6. Обережно версіонуйте payload-и/контракти job-ів.
+
+#### Поширені помилки
+
+1. Запуск важкої job-логіки тільки в API-процесі.
+2. Відсутність retry/backoff стратегії (або безкінечні retry).
+3. Неідемпотентні side effects, що дають дублікати на retry.
+4. Відсутність observability для failed jobs.
+
+#### Правило практики
+
+Якщо робота повільна, потребує retry або не критична для миттєвої відповіді -
+ставте її в чергу. Тримайте request path швидким, а обробку делегуйте воркерам.
+
 </details>
 
 <details>
@@ -3859,12 +6003,172 @@ persistence-логіки.
 
 #### NestJS
 
+Ідемпотентний дизайн job-ів означає: багаторазове виконання тієї самої задачі
+дає той самий фінальний стан, що й одноразове виконання.
+
+Для queue-систем це обов'язково, бо retries, рестарти воркерів і семантика
+доставки можуть спричиняти дублікати виконання.
+
+#### Чому виникають дублікати
+
+1. Воркер падає після side effect, але до ACK.
+2. Retry після timeout/network partition.
+3. Ручні requeue/replay операції.
+4. Гонки між кількома консюмерами.
+
+#### Базові стратегії ідемпотентності
+
+1. **Business idempotency key**
+   Додавайте стабільний унікальний ключ операції
+   (`paymentId`, `orderId:action`).
+
+2. **Deduplication store**
+   Зберігайте оброблені ключі/статуси в DB/Redis з унікальним обмеженням.
+
+3. **Atomic check-and-set**
+   Гарантуйте "first execution wins" через транзакцію/lock/unique insert.
+
+4. **Outbox/inbox patterns**
+   Ведіть облік оброблених message ID, щоб уникати повторних side effects.
+
+5. **Idempotent side-effect API**
+   Використовуйте idempotency keys зовнішнього провайдера, якщо підтримується.
+
+#### Практичний job flow
+
+1. Job стартує з `idempotencyKey`.
+2. Спроба атомарно зарезервувати ключ:
+   1. Якщо вже `completed` -> завершити успішно (no-op).
+   2. Якщо зарезервовано зараз -> продовжити.
+3. Виконати side effects.
+4. Позначити ключ як `completed` з метаданими результату.
+5. У разі помилки зберегти retry-політику, не ламаючи семантику idempotency-запису.
+
+#### Приклад моделі ключа
+
+1. `job_key` (unique)
+2. `status` (`processing`, `completed`, `failed`)
+3. `updated_at`
+4. опційно `result_hash` / `external_reference`
+
+#### Техніки на рівні черги
+
+1. Встановлюйте детермінований `jobId` при enqueue
+   (у багатьох engine це запобігає дублю enqueue).
+2. Використовуйте обмежені retries + backoff.
+3. Уникайте паралельної обробки однієї сутності (partitioning/locking).
+
+#### Практичні підказки для NestJS/Bull
+
+1. Ставте idempotency guard на старті processor-а, не лише на producer-стороні.
+2. По можливості тримайте processor транзакційним.
+3. Для зовнішніх викликів прокидуйте idempotency header/key downstream.
+4. Логуйте структуровано: key + attempt + outcome.
+
+#### Поширені помилки
+
+1. Припущення про "exactly once" доставку з черги.
+2. Виконання side effects до резервування idempotency-ключа.
+3. Ключування випадковим UUID на кожному retry (ламає deduplication).
+4. Надто раннє видалення idempotency-записів.
+
+#### Правило практики
+
+Проєктуйте кожен background job як at-least-once delivered. Безпечними retries
+робить саме бізнес-ідемпотентність на межі операції.
+
 </details>
 
 <details>
 <summary>80. Як реалізувати WebSockets у NestJS?</summary>
 
 #### NestJS
+
+WebSockets у NestJS реалізуються через Gateway, зазвичай із пакетом
+`@nestjs/websockets` та адаптером Socket.IO (найпоширеніший дефолтний підхід).
+
+#### Базові концепції
+
+1. **Gateway**
+   Точка входу WebSocket (подібна до ролі контролера в HTTP).
+
+2. **Events/messages**
+   Клієнт відправляє події з payload; сервер обробляє і відповідає/емітить події.
+
+3. **Lifecycle hooks**
+   Обробка connect/disconnect та ініціалізації сервера.
+
+#### Базовий приклад gateway
+
+```ts
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+
+@WebSocketGateway({
+  cors: { origin: ['https://app.example.com'], credentials: true },
+  namespace: '/chat',
+})
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server: Server;
+
+  handleConnection(client: Socket) {
+    // auth/context checks can happen here
+  }
+
+  handleDisconnect(client: Socket) {
+    // cleanup presence/resources
+  }
+
+  @SubscribeMessage('chat.send')
+  async onSend(
+    @MessageBody() payload: { roomId: string; text: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.server.to(payload.roomId).emit('chat.message', {
+      userId: client.id,
+      text: payload.text,
+      sentAt: new Date().toISOString(),
+    });
+  }
+}
+```
+
+#### Патерни кімнат і broadcast
+
+1. Приєднання до кімнати: `client.join(roomId)`.
+2. Відправка в кімнату: `server.to(roomId).emit(...)`.
+3. Відправка всім: `server.emit(...)`.
+4. Відповідь тільки відправнику: `client.emit(...)`.
+
+#### Валідація і безпека
+
+1. Валідовуйте payload повідомлень (DTO/pipes).
+2. Автентифікуйте з'єднання (token/session під час handshake).
+3. Авторизуйте доступ до кімнат для кожної події.
+4. Додавайте rate limiting/throttling для "шумних" подій.
+
+#### Production-моменти
+
+1. Для multi-instance масштабування потрібен adapter/pub-sub
+   (наприклад, Redis adapter) для міжвузлової доставки подій.
+2. Використовуйте sticky sessions/load balancer стратегію, якщо цього вимагає транспорт.
+3. Відстежуйте кількість з'єднань, throughput подій і причини disconnect.
+4. Тримайте handlers легкими; важку роботу виносьте в queues/workers.
+
+#### Правило практики
+
+WebSockets використовуйте для low-latency двосторонніх фіч (чат, live updates,
+presence). Контракти протоколу робіть явними й захищайте так само, як будь-який
+публічний API.
 
 </details>
 
