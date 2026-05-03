@@ -5785,3 +5785,2827 @@ Puis évoluez vers une invalidation événementielle/par tags quand la complexit
 métier augmente.
 
 </details>
+
+<details>
+<summary>70. Quand faut-il utiliser les Observables au lieu des Promises dans NestJS ?</summary>
+
+#### NestJS
+
+Utilisez les Observables dans NestJS quand vous avez besoin de **flux,
+annulation, composition de plusieurs événements asynchrones, ou opérateurs
+réactifs**. Utilisez les Promises pour des opérations async simples et ponctuelles.
+
+#### Différence centrale
+
+1. **Promise**
+   Une valeur finale unique (ou erreur), résolue une seule fois.
+
+2. **Observable**
+   Flux lazy de 0..N valeurs dans le temps, avec opérateurs RxJS riches
+   et annulation.
+
+#### Quand les Observables sont plus adaptés
+
+1. **Cas de streaming**
+   Server-Sent Events, flux type websocket, réponses chunkées.
+
+2. **Composition de multiples sources async**
+   Combiner timers, appels HTTP, événements utilisateur, retries via opérateurs.
+
+3. **Comportements avancés retry/backoff/circuit**
+   Opérateurs RxJS (`retryWhen`, `timeout`, `catchError`, `switchMap`, etc.).
+
+4. **Flux sensibles à l’annulation**
+   Se désabonner pour arrêter le travail et libérer les ressources.
+
+5. **Fonctionnalités de l’écosystème Nest**
+   Les interceptors et `HttpService` retournent naturellement des Observables.
+
+#### Quand Promise est préférable
+
+1. Un appel -> une réponse DB/API.
+2. Logique de service simple avec `async/await`.
+3. Équipe qui n’utilise pas en profondeur les patterns réactifs.
+
+#### Exemples pratiques NestJS
+
+1. `HttpService.get(...)` retourne `Observable<AxiosResponse<T>>`.
+2. Les endpoints SSE retournent souvent `Observable<MessageEvent>`.
+3. Les message patterns microservices peuvent exploiter des flux réactifs.
+
+#### Pattern d’interop
+
+Si votre app utilise `async/await` mais reçoit un Observable :
+
+```ts
+const response = await firstValueFrom(this.http.get('/users'));
+```
+
+Si vous avez besoin d’une seule valeur du flux, convertissez explicitement
+(`firstValueFrom` ou `lastValueFrom`) et gardez des frontières claires.
+
+#### Règle de décision
+
+1. Besoin d’une valeur unique une fois -> Promise (`async/await`).
+2. Besoin de stream/composition retry/annulation -> Observable.
+
+Choisissez un style par frontière de module autant que possible pour éviter la
+complexité async mixte.
+
+</details>
+
+<details>
+<summary>71. Quelle est la différence entre async/await et RxJS pour gérer la logique asynchrone, et quand utiliser chaque approche ?</summary>
+
+#### NestJS
+
+`async/await` et RxJS résolvent l’asynchrone à des niveaux de complexité différents.
+Aucune approche n’est universellement meilleure ; choisissez selon le modèle
+d’exécution.
+
+#### Différence centrale
+
+1. **`async/await` (Promises)**
+   Idéal pour des tâches asynchrones à résultat unique avec un flux de contrôle linéaire.
+
+2. **RxJS (Observables)**
+   Idéal pour les flux d’événements, les flux multi-valeurs, l’annulation
+   et la composition avancée dans le temps.
+
+#### Forces de `async/await`
+
+1. Code impératif très lisible.
+2. Gestion des erreurs simple avec `try/catch`.
+3. Idéal pour des méthodes service request-response (DB/API une fois).
+4. Charge cognitive plus faible pour la plupart des équipes.
+
+#### Forces de RxJS
+
+1. Composition de plusieurs flux async (`mergeMap`, `switchMap`, `combineLatest`).
+2. Opérateurs puissants retry/backoff/timeout.
+3. Annulation native via unsubscribe.
+4. Patterns de traitement en flux (SSE, websockets, pipelines réactifs).
+
+#### Répartition d’usage typique dans NestJS
+
+1. **Services/contrôleurs**
+   Souvent `async/await` pour les use cases métier.
+
+2. **`HttpService` / interceptors / endpoints streaming**
+   Souvent Observables, convertis optionnellement en Promise si une seule valeur est nécessaire.
+
+#### Interopérabilité
+
+Observable -> Promise :
+
+```ts
+const res = await firstValueFrom(this.http.get('/health'));
+```
+
+Promise -> Observable :
+
+```ts
+from(this.usersService.findById(id))
+```
+
+#### Quand choisir `async/await`
+
+1. Endpoints type CRUD.
+2. Appels DB/API ponctuels.
+3. Équipe privilégiant un flux de contrôle direct.
+
+#### Quand choisir RxJS
+
+1. Flux continus ou pipelines temps réel.
+2. Orchestration complexe de multiples sources async.
+3. Besoin d’un comportement sensible à l’annulation et d’un contrôle par opérateurs.
+
+#### Erreurs fréquentes
+
+1. Utiliser RxJS pour des opérations triviales one-off (sur-ingénierie).
+2. Forcer le style Promise dans des scénarios streaming (perte des bénéfices réactifs).
+3. Mélanger les deux styles de manière chaotique dans le même module.
+
+#### Règle pratique
+
+Par défaut, utilisez `async/await` pour la logique métier simple ; introduisez RxJS
+là où la réactivité/composition de flux apporte un bénéfice opérationnel clair.
+
+</details>
+
+<details>
+<summary>72. Comment éviter de bloquer l’event loop dans NestJS et maintenir les performances ?</summary>
+
+#### NestJS
+
+NestJS s’exécute sur l’event loop Node.js. Si vous bloquez cette boucle avec des
+opérations CPU lourdes ou synchrones, toutes les requêtes concurrentes subissent
+des pics de latence.
+
+#### Ce qui bloque l’event loop
+
+1. Tâches CPU synchrones lourdes (hash de gros payloads, traitement image/vidéo).
+2. Gros parsing/stringifying JSON synchrones en boucle.
+3. APIs filesystem synchrones (`fs.readFileSync`, etc.) sur le chemin requête.
+4. Boucles serrées longues sans rendre la main.
+5. Regex coûteuses/backtracking et algorithmes inefficaces.
+
+#### Stratégies pratiques pour éviter le blocage
+
+1. **Préférer les APIs I/O asynchrones**
+   Utiliser des opérations non bloquantes filesystem/réseau/DB.
+
+2. **Déporter le CPU lourd hors du thread requête**
+   1. Worker threads (`worker_threads`)
+   2. Jobs/queues en arrière-plan (BullMQ, RabbitMQ, etc.)
+   3. Services de traitement dédiés
+
+3. **Utiliser le streaming pour les gros payloads**
+   Éviter de bufferiser d’énormes fichiers/objets en mémoire.
+
+4. **Paginer et chunker le travail**
+   Traiter les grands datasets en lots au lieu d’une énorme opération synchrone.
+
+5. **Mettre en cache les calculs coûteux**
+   Réutiliser les résultats quand possible.
+
+#### Patterns d’architecture NestJS
+
+1. Garder les contrôleurs légers ; déléguer les tâches lourdes à des workers async.
+2. Utiliser des queues pour email/PDF/reports/conversion média.
+3. Définir des timeouts et politiques de backpressure sur les appels externes.
+4. Appliquer du rate limiting sur les endpoints coûteux.
+
+#### Signaux de monitoring d’un blocage event loop
+
+1. Hausse du p95/p99 avec trafic modéré.
+2. Faible CPU idle mais faible throughput.
+3. Timers retardés et health checks lents.
+4. Augmentation des métriques de lag event loop.
+
+#### Outils opérationnels utiles
+
+1. Monitoring du lag event loop (`perf_hooks`, outils APM).
+2. Profiling CPU/flamegraphs sur les hot paths.
+3. Dashboards de latence et taille de payload par endpoint.
+
+#### Erreurs fréquentes
+
+1. Faire crypto/compression synchrones dans les handlers de requêtes.
+2. Générer de gros rapports inline pendant la requête HTTP.
+3. Lire d’énormes fichiers en mémoire au lieu de streamer.
+4. Ignorer la complexité algorithmique dans les boucles sur grands tableaux.
+
+#### Règle pratique
+
+Le thread requête doit orchestrer, pas calculer lourdement. Gardez-le non bloquant
+et déléguez le travail coûteux à une infrastructure asynchrone.
+
+</details>
+
+<details>
+<summary>73. Comment optimiser la latence (p95 / p99) et quels facteurs influencent ces métriques ?</summary>
+
+#### NestJS
+
+`p95` et `p99` sont des percentiles de latence de queue : ils montrent la lenteur
+des 5 % et 1 % de requêtes les plus lentes. En production, la fiabilité dépend
+plus de ces queues que de la latence moyenne.
+
+#### Ce qui impacte le plus p95/p99
+
+1. Inefficacité des requêtes DB (N+1, index manquants, contention de verrous).
+2. Lenteur des dépendances externes (APIs HTTP, queues, providers d’auth).
+3. Blocage de l’event loop (tâches CPU synchrones lourdes).
+4. Saturation des pools de connexions (DB/HTTP).
+5. Taille des payloads et coût de sérialisation.
+6. Taux de cache miss et cold starts.
+7. Pauses GC et pression mémoire.
+8. Tempêtes de retries/timeouts en cascade pendant les pannes.
+
+#### Stratégie d’optimisation (impact maximal d’abord)
+
+1. **Mesurer d’abord**
+   Ajouter des dashboards p50/p95/p99 par endpoint et des traces par dépendance.
+
+2. **Corriger les hot paths DB**
+   Indexer les filtres critiques, supprimer N+1, optimiser les joins, paginer correctement.
+
+3. **Protéger les appels externes**
+   Timeouts stricts, retries bornés avec jitter, circuit breakers, fallbacks.
+
+4. **Réduire le travail sur le chemin requête**
+   Déporter le CPU lourd vers workers/queues ; garder le chemin HTTP léger.
+
+5. **Mettre en cache intelligemment**
+   Cacher les données coûteuses et très lues (Redis/in-memory selon le cas).
+
+6. **Ajuster pools et concurrence**
+   Dimensionner correctement les pools DB/HTTP et éviter l’accumulation de files.
+
+7. **Contrôler les payloads**
+   Limiter les champs de réponse, compresser, éviter d’énormes objets JSON.
+
+#### Actions pratiques spécifiques NestJS
+
+1. Ajouter un logging de latence par interceptor avec requestId.
+2. Instrumenter les appels downstream (DB et `HttpService`) avec timing et statut.
+3. Définir des politiques globales de timeout pour les appels amont.
+4. Appliquer du rate limiting sur endpoints coûteux.
+5. Utiliser des jobs en arrière-plan pour les tâches synchrones non critiques.
+
+#### Anti-patterns typiques de latence de queue
+
+1. Endpoint qui exécute plusieurs appels externes séquentiels.
+2. Transactions DB longues sur des chemins de lecture.
+3. Warmup cache par requête sans mémoïsation.
+4. Transformations DTO massives dans les hot paths.
+
+#### Approche orientée SLO
+
+1. Définir des SLO de latence par classe d’endpoint (read, write, auth).
+2. Alerter sur dépassement p95/p99 (pas seulement la moyenne).
+3. Exécuter des tests de charge avec distribution de trafic proche production.
+4. Suivre les régressions par release via checks de perf en CI si possible.
+
+#### Règle pratique
+
+Pour améliorer le p99, optimisez les pires chemins et le comportement en échec,
+pas seulement les chemins médians. La latence de queue est surtout un problème de
+système et de dépendances.
+
+</details>
+
+<details>
+<summary>74. Comment utiliser le mode cluster de Node.js avec NestJS pour le scaling ?</summary>
+
+#### NestJS
+
+Le mode cluster exécute plusieurs processus workers Node.js sur une même machine,
+permettant à une app NestJS d’utiliser plusieurs cœurs CPU au lieu d’une seule
+event loop.
+
+#### Pourquoi utiliser le mode cluster
+
+1. Meilleure utilisation CPU sur serveurs multi-cœurs.
+2. Débit plus élevé pour des charges CPU/mixtes.
+3. Isolation au niveau processus (le crash d’un worker ne tue pas tous les workers).
+
+#### Concept de setup cluster de base
+
+1. Le processus primaire fork `N` workers (`N` = souvent nombre de cœurs CPU).
+2. Chaque worker démarre l’app Nest sur le même port.
+3. Node distribue les connexions entrantes entre workers.
+
+#### Exemple de bootstrap (conceptuel)
+
+```ts
+import cluster from 'cluster';
+import { cpus } from 'os';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrapWorker() {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(3000);
+}
+
+if (cluster.isPrimary) {
+  const workerCount = cpus().length;
+  for (let i = 0; i < workerCount; i++) cluster.fork();
+
+  cluster.on('exit', () => {
+    cluster.fork(); // auto-restart naïf
+  });
+} else {
+  bootstrapWorker();
+}
+```
+
+#### Considérations importantes en production
+
+1. **Statelessness**
+   L’état en mémoire est par worker et non partagé.
+   Utiliser Redis/DB pour sessions/cache/verrous partagés.
+
+2. **WebSockets**
+   Besoin de sticky sessions ou d’un adapter pub/sub externe pour la cohérence multi-workers.
+
+3. **Rate limiting/cache**
+   Les implémentations in-memory deviennent incohérentes entre workers.
+   Préférer des stores Redis.
+
+4. **Arrêt gracieux**
+   Gérer SIGTERM/SIGINT et drainer proprement les connexions par worker.
+
+5. **Observabilité**
+   Inclure worker ID/process ID dans logs et métriques.
+
+#### Cluster vs conteneurs/orchestrateurs
+
+1. Cluster scale verticalement sur un seul host.
+2. Réplicas Kubernetes/PM2/systemd scalent horizontalement sur plusieurs hosts.
+3. Beaucoup d’équipes privilégient d’abord le scaling horizontal, et utilisent cluster si nécessaire.
+
+#### Quand le mode cluster est pertinent
+
+1. Déploiements bare-metal/VM avec CPU multi-cœurs.
+2. Besoin de débit supplémentaire sans changement infra immédiat.
+3. App majoritairement stateless et prête pour un comportement multi-process.
+
+#### Règle pratique
+
+Le cluster peut augmenter le débit sur un hôte unique, mais ce n’est pas un
+substitut à une architecture distribuée. Combinez-le avec un état externalisé
+et une gestion de processus solide.
+
+</details>
+
+<details>
+<summary>75. Comment implémenter des cron jobs dans NestJS via @nestjs/schedule ?</summary>
+
+#### NestJS
+
+Dans NestJS, les cron jobs s’implémentent avec `@nestjs/schedule`, qui fournit des
+décorateurs déclaratifs pour intervalles fixes, timeouts et expressions cron.
+
+#### Étape 1 : installer et activer ScheduleModule
+
+```ts
+import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
+
+@Module({
+  imports: [ScheduleModule.forRoot()],
+})
+export class AppModule {}
+```
+
+#### Étape 2 : créer un service planifié
+
+```ts
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression, Interval, Timeout } from '@nestjs/schedule';
+
+@Injectable()
+export class JobsService {
+  private readonly logger = new Logger(JobsService.name);
+
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  handleDailyJob() {
+    this.logger.log('Running daily job');
+  }
+
+  @Interval(60_000)
+  handleEveryMinute() {
+    this.logger.log('Running interval job');
+  }
+
+  @Timeout(10_000)
+  handleStartupDelayedTask() {
+    this.logger.log('Running one-time delayed task');
+  }
+}
+```
+
+#### Expression cron personnalisée avec fuseau horaire
+
+```ts
+@Cron('0 9 * * 1-5', { timeZone: 'Europe/Kyiv' })
+runWeekdayAt9am() {}
+```
+
+#### Cron jobs dynamiques (runtime)
+
+Pour des plannings configurables par utilisateur, utilisez `SchedulerRegistry`
+pour ajouter/supprimer des jobs à l’exécution au lieu de décorateurs statiques.
+
+#### Considérations production
+
+1. **Risque de duplication multi-instances**
+   En déploiement scalé, chaque instance exécute les crons sans coordination.
+   Utiliser un verrou distribué (Redis/verrou DB) ou un worker dédié.
+
+2. **Idempotence**
+   Les handlers de jobs doivent être sûrs en retry/ré-exécution.
+
+3. **Gestion d’erreurs**
+   Encadrer les jobs avec try/catch et logs/alertes structurés.
+
+4. **Timeouts et backpressure**
+   Éviter le chevauchement d’exécutions longues sauf si intentionnel.
+
+5. **Observabilité**
+   Émettre des métriques : début/fin/durée/succès/échec.
+
+#### Cas d’usage courants
+
+1. Nettoyage de sessions/tokens expirés.
+2. Synchronisation avec des systèmes externes.
+3. Rapports/notifications planifiés.
+4. Agrégation de données et préchauffage de cache.
+
+#### Règle pratique
+
+`@nestjs/schedule` est parfait pour la planification au niveau application,
+mais en systèmes distribués, il faut une coordination pour éviter
+les exécutions dupliquées.
+
+</details>
+
+<details>
+<summary>76. Qu’est-ce que EventEmitter dans NestJS et en quoi diffère-t-il des queues (Bull) ?</summary>
+
+#### NestJS
+
+`EventEmitter` dans NestJS (`@nestjs/event-emitter`) est un mécanisme pub/sub
+in-process pour la communication interne entre modules. Il est rapide et simple,
+mais non durable en cas de crash/redémarrage du process.
+
+Les queues Bull/BullMQ sont des systèmes persistants de traitement de jobs
+(généralement adossés à Redis), conçus pour l’exécution en arrière-plan,
+les retries et la fiabilité.
+
+#### Différence centrale
+
+1. **EventEmitter**
+   1. En mémoire, même process.
+   2. Événements module fire-and-forget.
+   3. Pas de persistance durable par défaut.
+
+2. **Bull/BullMQ**
+   1. Stockage persistant des jobs (Redis).
+   2. Workers qui traitent les jobs en arrière-plan.
+   3. Support retries, délais, backoff, concurrence et monitoring.
+
+#### Quand utiliser EventEmitter
+
+1. Événements de domaine internes à une seule instance de service.
+2. Effets secondaires légers (trigger audit log, signal d’invalidation de cache).
+3. Découplage async non critique, où une perte occasionnelle est acceptable.
+
+#### Quand utiliser Bull/BullMQ
+
+1. Tâches critiques qui doivent survivre aux redémarrages.
+2. Jobs longs/lourds (emails, rapports, traitement média).
+3. Besoin de retry/backoff et gestion dead-letter.
+4. Besoin de lisser la charge et contrôler la concurrence.
+
+#### Comparaison du modèle de fiabilité
+
+1. **EventEmitter**
+   Si l’app crash après l’emit et avant l’exécution du handler, l’événement peut être perdu.
+
+2. **Queue**
+   Le job est persisté ; un worker peut reprendre plus tard selon des politiques de retry.
+
+#### Compromis latence/complexité
+
+1. EventEmitter :
+   Latence plus faible, complexité opérationnelle plus faible.
+
+2. Queue :
+   Latence un peu plus élevée et complexité infra plus forte, mais fiabilité bien supérieure.
+
+#### Pattern NestJS pratique
+
+1. Émettre des événements de domaine locaux pour des réactions immédiates non critiques.
+2. Enfiler des jobs background durables pour les travaux importants/coûteux.
+3. Pour l’intégration inter-services, utiliser des brokers/messages events,
+   pas uniquement EventEmitter in-process.
+
+#### Règle pratique
+
+Si la perte d’un événement est inacceptable, utilisez Bull/BullMQ (ou une
+messagerie adossée à un broker), pas un EventEmitter simple.
+
+</details>
+
+<details>
+<summary>77. Comment implémenter une communication interne orientée événements entre modules via EventEmitter2 ?</summary>
+
+#### NestJS
+
+La communication interne orientée événements dans NestJS avec EventEmitter2
+découple les modules : un module émet un événement de domaine, d’autres modules
+réagissent sans appels de service directs.
+
+#### Étape 1 : activer EventEmitterModule
+
+```ts
+import { Module } from '@nestjs/common';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+
+@Module({
+  imports: [
+    EventEmitterModule.forRoot({
+      wildcard: true,
+      delimiter: '.',
+      maxListeners: 20,
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+#### Étape 2 : émettre des événements depuis le flux applicatif
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly events: EventEmitter2) {}
+
+  async createOrder(input: { orderId: string; userId: string; total: number }) {
+    // ...persist order
+    this.events.emit('order.created', {
+      orderId: input.orderId,
+      userId: input.userId,
+      total: input.total,
+      occurredAt: new Date().toISOString(),
+    });
+  }
+}
+```
+
+#### Étape 3 : s’abonner dans d’autres modules avec `@OnEvent`
+
+```ts
+import { Injectable, Logger } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+
+@Injectable()
+export class NotificationsListener {
+  private readonly logger = new Logger(NotificationsListener.name);
+
+  @OnEvent('order.created')
+  async handleOrderCreated(event: { orderId: string; userId: string; total: number }) {
+    this.logger.log(`Send confirmation for order ${event.orderId}`);
+    // send email / push / audit entry
+  }
+}
+```
+
+#### Conventions de nommage et payload
+
+1. Utiliser des noms stables : `domain.action` (`order.created`, `user.deleted`).
+2. Garder un payload explicite et versionnable.
+3. Inclure des métadonnées (`occurredAt`, `correlationId`, `source`).
+
+#### Considérations de gestion d’erreurs
+
+1. Les handlers d’événements doivent catch/log leurs propres erreurs.
+2. Un listener en échec ne doit pas casser le flux transactionnel principal.
+3. Pour des effets secondaires critiques, enfiler des jobs durables au lieu de dépendre uniquement de la livraison en mémoire.
+
+#### Guidance d’architecture module
+
+1. Émettre les événements depuis les services applicatifs après changement d’état réussi.
+2. Garder les listeners dans des modules dédiés (notifications, analytics, audit).
+3. Éviter les dépendances circulaires en communiquant par événements plutôt que par injection directe de services.
+
+#### Règle pratique
+
+Utilisez EventEmitter2 pour le découplage interne dans un seul process de service.
+Pour l’inter-services ou la livraison garantie, utilisez des queues/brokers de messages.
+
+</details>
+
+<details>
+<summary>78. Comment implémenter des jobs en arrière-plan avec Bull ou BullMQ ?</summary>
+
+#### NestJS
+
+Les jobs en arrière-plan dans NestJS servent à déplacer le travail lourd ou non
+immédiat hors du chemin requête/réponse (emails, rapports, traitement média,
+tâches de synchronisation).
+
+Bull/BullMQ fournissent des queues durables adossées à Redis, avec retries,
+délais et contrôle de concurrence des workers.
+
+#### Architecture typique
+
+1. L’API/service enfile rapidement un job.
+2. Un worker/processor consomme le job de façon asynchrone.
+3. L’état du job est suivi (`waiting`, `active`, `completed`, `failed`).
+
+#### Étape 1 : enregistrer le module de queue
+
+Setup de module style Bull :
+
+```ts
+import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bull';
+
+@Module({
+  imports: [
+    BullModule.forRoot({
+      redis: { host: '127.0.0.1', port: 6379 },
+    }),
+    BullModule.registerQueue({ name: 'emails' }),
+  ],
+})
+export class JobsModule {}
+```
+
+#### Étape 2 : produire des jobs
+
+```ts
+import { InjectQueue } from '@nestjs/bull';
+import { Injectable } from '@nestjs/common';
+import { Queue } from 'bull';
+
+@Injectable()
+export class NotificationsService {
+  constructor(@InjectQueue('emails') private readonly emailsQueue: Queue) {}
+
+  async enqueueWelcomeEmail(userId: string, email: string) {
+    await this.emailsQueue.add(
+      'send-welcome-email',
+      { userId, email },
+      {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: true,
+      },
+    );
+  }
+}
+```
+
+#### Étape 3 : consommer les jobs dans un processor
+
+```ts
+import { Process, Processor } from '@nestjs/bull';
+import { Job } from 'bull';
+
+@Processor('emails')
+export class EmailsProcessor {
+  @Process('send-welcome-email')
+  async handleWelcome(job: Job<{ userId: string; email: string }>) {
+    // call provider/send email
+  }
+}
+```
+
+#### Note BullMQ
+
+BullMQ utilise des APIs plus récentes (`Queue`, `Worker`, `QueueEvents`) et est
+recommandé pour les écosystèmes plus récents. Le flux conceptuel est identique :
+producer -> queue Redis -> worker.
+
+#### Bonnes pratiques production
+
+1. Rendre les jobs idempotents (sûrs en retry).
+2. Définir explicitement attempts/backoff et politiques d’échec.
+3. Utiliser des processus worker dédiés pour les queues lourdes.
+4. Surveiller profondeur de queue, temps de traitement et taux d’échec.
+5. Avoir un workflow dead-letter/analyse retry pour les jobs empoisonnés.
+6. Versionner soigneusement les payloads/contrats de jobs.
+
+#### Erreurs fréquentes
+
+1. Exécuter la logique de jobs lourds uniquement dans le process API.
+2. Pas de stratégie retry/backoff (ou retries infinis).
+3. Effets secondaires non idempotents causant des doublons en retry.
+4. Manque d’observabilité sur les jobs échoués.
+
+#### Règle pratique
+
+Si le travail est lent, retryable, ou non critique pour la réponse immédiate,
+enfilez-le. Gardez le chemin requête rapide et déléguez le traitement aux workers
+de queue.
+
+</details>
+
+<details>
+<summary>79. Comment concevoir des jobs idempotents (task queues) pour éviter les exécutions dupliquées ?</summary>
+
+#### NestJS
+
+Concevoir un job idempotent signifie qu’exécuter le même job plusieurs fois produit
+le même état final que l’exécuter une seule fois.
+
+C’est obligatoire dans les systèmes de queue, car les retries, redémarrages de
+workers et sémantiques de livraison peuvent provoquer des tentatives dupliquées.
+
+#### Pourquoi les doublons arrivent
+
+1. Le worker crash après l’effet secondaire mais avant l’ACK.
+2. Retry après timeout/partition réseau.
+3. Opérations manuelles de requeue/replay.
+4. Race conditions multi-consumers.
+
+#### Stratégies clés d’idempotence
+
+1. **Clé d’idempotence métier**
+   Inclure une clé unique stable par opération (`paymentId`, `orderId:action`).
+
+2. **Store de déduplication**
+   Persister les clés/statuts traités en DB/Redis avec contrainte d’unicité.
+
+3. **Check-and-set atomique**
+   Garantir « first execution wins » via transaction/verrou/insert unique.
+
+4. **Patterns outbox/inbox**
+   Suivre les IDs de messages traités pour éviter les effets secondaires répétés.
+
+5. **APIs d’effets secondaires idempotentes**
+   Utiliser des clés d’idempotence côté fournisseur externe si supporté.
+
+#### Flux pratique d’un job
+
+1. Le job démarre avec `idempotencyKey`.
+2. Tenter de réserver la clé atomiquement :
+   1. Si déjà complétée -> sortir avec succès (no-op).
+   2. Si réservée maintenant -> continuer.
+3. Exécuter les effets secondaires.
+4. Marquer la clé complétée avec métadonnées de résultat.
+5. En cas d’échec, conserver la politique de retry tout en préservant la sémantique d’idempotence.
+
+#### Exemple de modèle de clé
+
+1. `job_key` (unique)
+2. `status` (`processing`, `completed`, `failed`)
+3. `updated_at`
+4. optionnel `result_hash` / `external_reference`
+
+#### Techniques au niveau queue
+
+1. Définir un `jobId` déterministe à l’enqueue (empêche les doublons d’enqueue dans beaucoup de moteurs).
+2. Utiliser retries bornés + backoff.
+3. Éviter le traitement concurrent de la même entité (partitionnement/verrouillage).
+
+#### Indications pratiques NestJS/Bull
+
+1. Mettre le guard d’idempotence au début du processor, pas seulement côté producer.
+2. Garder le processor transactionnel quand c’est possible.
+3. Pour les appels externes, transmettre header/clé d’idempotence en aval.
+4. Émettre des logs structurés avec clé + tentative + résultat.
+
+#### Erreurs fréquentes
+
+1. Supposer une livraison « exactly once » depuis la queue.
+2. Exécuter des effets secondaires avant la réservation d’idempotence.
+3. Utiliser un UUID aléatoire par retry (casse la déduplication).
+4. Supprimer trop tôt les enregistrements d’idempotence.
+
+#### Règle pratique
+
+Concevez chaque job background comme livré en at-least-once.
+L’idempotence à la frontière métier est ce qui rend les retries sûrs.
+
+</details>
+
+<details>
+<summary>80. Comment implémenter les WebSockets dans NestJS ?</summary>
+
+#### NestJS
+
+Les WebSockets dans NestJS s’implémentent via des Gateways, généralement avec le
+package `@nestjs/websockets` et un adapter Socket.IO (setup par défaut le plus
+courant).
+
+#### Concepts clés
+
+1. **Gateway**
+   Point d’entrée WebSocket (rôle similaire à un contrôleur HTTP).
+
+2. **Événements/messages**
+   Le client émet des noms d’événements avec payloads ; le serveur traite
+   puis répond/émet.
+
+3. **Hooks de cycle de vie**
+   Gérer la connexion/déconnexion et l’initialisation serveur.
+
+#### Exemple de gateway basique
+
+```ts
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+
+@WebSocketGateway({
+  cors: { origin: ['https://app.example.com'], credentials: true },
+  namespace: '/chat',
+})
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server: Server;
+
+  handleConnection(client: Socket) {
+    // auth/context checks can happen here
+  }
+
+  handleDisconnect(client: Socket) {
+    // cleanup presence/resources
+  }
+
+  @SubscribeMessage('chat.send')
+  async onSend(
+    @MessageBody() payload: { roomId: string; text: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.server.to(payload.roomId).emit('chat.message', {
+      userId: client.id,
+      text: payload.text,
+      sentAt: new Date().toISOString(),
+    });
+  }
+}
+```
+
+#### Patterns room et broadcast
+
+1. Rejoindre une room : `client.join(roomId)`.
+2. Émettre vers une room : `server.to(roomId).emit(...)`.
+3. Émettre à tous : `server.emit(...)`.
+4. Émettre seulement à l’émetteur : `client.emit(...)`.
+
+#### Validation et sécurité
+
+1. Valider les payloads des messages (DTO/pipes).
+2. Authentifier la connexion (token/session au handshake).
+3. Autoriser l’accès room par événement.
+4. Appliquer du rate limiting/throttling pour les événements bruyants.
+
+#### Considérations production
+
+1. Le scaling multi-instance exige un adapter/pub-sub (ex. Redis adapter)
+   pour la propagation inter-nœuds.
+2. Utiliser des sticky sessions/stratégie load balancer selon le transport.
+3. Suivre le nombre de connexions, le throughput d’événements et les raisons de déconnexion.
+4. Garder les handlers légers ; déplacer le travail lourd vers queues/workers.
+
+#### Règle pratique
+
+Utilisez les WebSockets pour les fonctionnalités bidirectionnelles faible latence
+(chat, live updates, présence). Gardez des contrats de protocole explicites et
+sécurisés comme pour toute API publique.
+
+</details>
+
+<details>
+<summary>81. Comment implémenter l’authentification dans un WebSocket Gateway ?</summary>
+
+#### NestJS
+
+L’authentification WebSocket dans NestJS se fait généralement pendant la phase de
+handshake, puis s’applique par événement via des guards/contrôles d’autorisation.
+
+#### Flux d’authentification typique
+
+1. Le client envoie un token (JWT/session) dans le handshake :
+   `auth`, headers ou query params (préférer `auth`/headers).
+
+2. Le serveur vérifie le token dans middleware/guard de gateway.
+
+3. Le contexte utilisateur authentifié est attaché au socket (`client.data.user`).
+
+4. Les handlers de messages suivants utilisent ce contexte pour l’autorisation.
+
+#### Exemple : authentifier à la connexion
+
+```ts
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  SubscribeMessage,
+  WebSocketGateway,
+} from '@nestjs/websockets';
+import { UnauthorizedException, UseGuards } from '@nestjs/common';
+import { Socket } from 'socket.io';
+
+@WebSocketGateway({ namespace: '/chat', cors: { origin: ['https://app.example.com'] } })
+export class ChatGateway implements OnGatewayConnection {
+  constructor(private readonly authService: AuthService) {}
+
+  async handleConnection(client: Socket) {
+    const token =
+      client.handshake.auth?.token ||
+      (client.handshake.headers.authorization as string | undefined)?.replace('Bearer ', '');
+
+    if (!token) throw new UnauthorizedException('Missing token');
+
+    const user = await this.authService.verifyAccessToken(token); // throws if invalid
+    client.data.user = user;
+  }
+
+  @SubscribeMessage('chat.send')
+  async onSend(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { roomId: string; text: string },
+  ) {
+    const user = client.data.user;
+    // authorize user for room access here
+    return { ok: true, userId: user.id, text: payload.text };
+  }
+}
+```
+
+#### Autorisation d’événement via guards
+
+1. Utiliser un `WsGuard` pour valider le contexte auth à chaque événement.
+2. Combiner avec des contrôles rôle/policy (membership room, scope tenant, permissions).
+
+#### Bonnes pratiques sécurité
+
+1. Préférer des access tokens courte durée.
+2. Re-vérifier l’autorisation sur les événements sensibles, pas seulement à la connexion.
+3. Gérer expiration/révocation des tokens (disconnect ou ré-auth requise).
+4. Ne jamais faire confiance aux user IDs envoyés par le client dans le payload ; utiliser le contexte auth du socket.
+5. Appliquer throttling/rate limits sur les événements sensibles auth.
+
+#### Notes de scaling
+
+1. En multi-instance, utiliser une stratégie partagée de vérification session/token.
+2. Si présence/rooms sont distribuées, utiliser un Redis adapter pour synchroniser l’état inter-nœuds.
+
+#### Règle pratique
+
+Authentifiez une fois au handshake pour l’efficacité, autorisez par événement pour
+la sécurité. Les deux couches sont nécessaires pour des systèmes temps réel sûrs.
+
+</details>
+
+<details>
+<summary>82. Quelles approches sont utilisées pour scaler des systèmes temps réel ?</summary>
+
+#### NestJS
+
+Le scaling des systèmes temps réel exige de traiter ensemble trois dimensions :
+1. l’échelle de connexions,
+2. le débit de messages,
+3. la cohérence d’état entre nœuds.
+
+#### Approches clés de scaling
+
+1. **Scaling horizontal des instances gateway**
+   Exécuter plusieurs réplicas WebSocket gateway derrière un load balancer.
+
+2. **Sticky sessions (si nécessaire)**
+   Garantir qu’un même client reste sur le même nœud si le modèle transport/session
+   exige une affinité.
+
+3. **Adapter pub/sub pour le broadcast inter-nœuds**
+   Utiliser un Redis adapter (ou équivalent) pour que les événements émis sur un nœud
+   atteignent les clients connectés aux autres nœuds.
+
+4. **État partagé externalisé**
+   Stocker présence/rooms/métadonnées de session en Redis/DB, pas seulement en mémoire process.
+
+5. **Backpressure et rate limiting**
+   Throttler les clients bruyants, limiter les pics de fan-out et protéger les systèmes aval.
+
+#### Patterns d’architecture
+
+1. **Couche gateway + couche workers**
+   Les gateways gèrent les connexions ; le traitement lourd est déplacé vers des queue workers.
+
+2. **Partitionnement des channels/rooms**
+   Partitionner les flux à haut volume par tenant/région/topic.
+
+3. **Backbone orienté événements**
+   Utiliser des brokers (Redis Streams/Kafka/NATS) pour une distribution durable
+   ou très haut débit quand un pub/sub simple ne suffit plus.
+
+4. **Optimisation du fan-out**
+   Pré-calculer les ensembles de destinataires et éviter des lookups DB coûteux par message.
+
+#### Techniques de performance et fiabilité
+
+1. Utiliser des payloads compacts et éviter les événements surdimensionnés.
+2. Appliquer des heartbeats/ping-pong avec timeouts raisonnables.
+3. Gérer une stratégie reconnect + replay pour les messages critiques manqués.
+4. Ajouter circuit breakers/timeouts pour les dépendances externes.
+5. Monitorer p95/p99 de latence de livraison d’événements et taux de perte.
+
+#### Must-have d’observabilité opérationnelle
+
+1. Connexions actives par nœud.
+2. Messages/sec entrants/sortants.
+3. Distribution de taille des rooms et hot rooms.
+4. Lag pub/sub inter-nœuds.
+5. Raisons d’erreur/déconnexion et taux de reconnexion réussi.
+
+#### Stack d’implémentation spécifique NestJS (typique)
+
+1. `@WebSocketGateway` pour les endpoints temps réel.
+2. Redis adapter pour la propagation d’événements multi-instances.
+3. Bull/BullMQ pour déporter les tâches async lourdes.
+4. `@nestjs/throttler` ou guards custom pour le contrôle des abus.
+
+#### Règle pratique
+
+Le scaling temps réel n’est pas juste « plus de pods ». Il faut combiner gateways
+horizontaux, pub/sub/état partagé et contrôle de flux strict pour garder une
+latence prévisible.
+
+</details>
+
+<details>
+<summary>83. Quelles sont les approches d’intégration de GraphQL dans NestJS (code-first vs schema-first), et quelle est la différence ?</summary>
+
+#### NestJS
+
+NestJS prend en charge deux approches d’intégration GraphQL :
+1. **Code-first**
+2. **Schema-first**
+
+Les deux sont valides en production. La différence tient à l’endroit où le contrat
+API est d’abord défini : classes/décorateurs TypeScript ou fichiers SDL `.graphql`.
+
+#### Approche code-first
+
+Vous définissez les types/résolveurs GraphQL en TypeScript avec des décorateurs,
+et le schéma est généré automatiquement.
+
+Style d’exemple :
+1. `@ObjectType()`, `@Field()`, `@InputType()`
+2. `@Resolver()`, `@Query()`, `@Mutation()`
+
+Avantages :
+1. Langage unique (TS) pour app + schéma.
+2. Typage fort et bon support refactor dans l’IDE.
+3. Moins de duplication entre DTO et modèle de schéma.
+
+Inconvénients :
+1. La lisibilité du schéma pour des parties prenantes non-TS peut être plus faible.
+2. Le schéma généré doit quand même être relu/versionné avec rigueur.
+
+#### Approche schema-first
+
+Vous définissez le schéma dans des fichiers `.graphql` (SDL), puis implémentez les
+résolveurs en TS.
+
+Avantages :
+1. Workflow contract-first (bon pour la gouvernance API).
+2. SDL explicite et facile à relire entre équipes.
+3. Bon choix quand le schéma est partagé entre langages/équipes.
+
+Inconvénients :
+1. Duplication potentielle entre SDL et types TS.
+2. Demande une discipline de synchronisation pour éviter la dérive.
+
+#### Exemples de setup NestJS (conceptuels)
+
+Code-first :
+
+```ts
+GraphQLModule.forRoot({
+  autoSchemaFile: true,
+});
+```
+
+Schema-first :
+
+```ts
+GraphQLModule.forRoot({
+  typePaths: ['./**/*.graphql'],
+});
+```
+
+#### Comment choisir
+
+1. Choisir **code-first** quand :
+   1. L’équipe est centrée TypeScript.
+   2. La vitesse d’itération est prioritaire.
+   3. Le schéma est principalement géré par l’équipe backend.
+
+2. Choisir **schema-first** quand :
+   1. Le contrat API est gouverné/partagé largement.
+   2. Plusieurs implémentations/consommateurs dépendent du SDL.
+   3. La revue/versioning du contrat est un workflow principal.
+
+#### Recommandation pratique
+
+Pour la plupart des équipes NestJS, code-first donne le développement le plus rapide
+avec un typage fort. Utilisez schema-first quand la gouvernance du contrat et la
+propriété SDL inter-équipes sont prioritaires.
+
+</details>
+
+<details>
+<summary>84. Que sont les resolvers en GraphQL et en quoi diffèrent-ils des contrôleurs REST ?</summary>
+
+#### NestJS
+
+Les resolvers GraphQL sont des fonctions qui résolvent les champs du schéma
+GraphQL. Ils constituent la couche d’exécution qui fournit les données pour les
+queries, mutations et champs d’objets imbriqués.
+
+Dans NestJS, les resolvers sont définis avec `@Resolver()` et des décorateurs de
+méthode comme `@Query()`, `@Mutation()` et `@ResolveField()`.
+
+#### Ce que font les resolvers
+
+1. Traiter les opérations GraphQL (`query`, `mutation`, subscriptions si utilisées).
+2. Résoudre les champs imbriqués à la demande (selon le selection set demandé).
+3. Accéder au contexte (utilisateur auth, métadonnées requête, loaders).
+4. Déléguer la logique métier aux services.
+
+#### Différences entre resolvers et contrôleurs REST
+
+1. **Forme de l’API**
+   Les contrôleurs REST exposent plusieurs endpoints URL.
+   Un resolver GraphQL expose un endpoint unique avec opérations pilotées par schéma.
+
+2. **Sélection des données**
+   REST renvoie une réponse fixe par endpoint.
+   GraphQL renvoie dynamiquement les champs sélectionnés par le client.
+
+3. **Modèle d’exécution**
+   Le contrôleur REST gère souvent toute la réponse d’un coup.
+   L’arbre de resolvers GraphQL peut exécuter plusieurs resolvers de champs.
+
+4. **Over/under-fetching**
+   REST impose souvent des compromis de design d’endpoints.
+   GraphQL réduit over/under-fetching via les selection sets.
+
+5. **Style de versioning**
+   REST utilise souvent un versioning API explicite.
+   GraphQL évolue en général par dépréciations et changements additifs du schéma.
+
+#### Exemple de resolver NestJS
+
+```ts
+import { Args, Mutation, Query, Resolver } from '@nestjs/graphql';
+
+@Resolver(() => User)
+export class UsersResolver {
+  constructor(private readonly usersService: UsersService) {}
+
+  @Query(() => User, { name: 'user' })
+  findOne(@Args('id') id: string) {
+    return this.usersService.findById(id);
+  }
+
+  @Mutation(() => User)
+  createUser(@Args('input') input: CreateUserInput) {
+    return this.usersService.create(input);
+  }
+}
+```
+
+#### Bonnes pratiques
+
+1. Garder les resolvers fins ; placer la logique métier dans les services.
+2. Utiliser DataLoader/batching pour éviter le N+1 dans les champs imbriqués.
+3. Valider args/inputs et appliquer l’authz via guards/contexte.
+4. Concevoir les types de schéma selon le langage domaine, pas directement selon les tables DB.
+
+#### Règle pratique
+
+Les resolvers sont l’équivalent GraphQL des contrôleurs, mais avec une exécution
+au niveau champ et une sélection de données pilotée par le client.
+
+</details>
+
+<details>
+<summary>85. Comment travailler avec le contexte en GraphQL et implémenter l’autorisation via celui-ci ?</summary>
+
+#### NestJS
+
+Dans GraphQL avec NestJS, `context` est le conteneur par requête qui transporte les
+métadonnées de requête (user, headers, requestId, loaders, infos tenant) vers
+les resolvers et les guards.
+
+L’autorisation est généralement implémentée en :
+1. authentifiant l’utilisateur dans le contexte,
+2. appliquant les règles d’accès avec des guards/policies adaptés à GraphQL.
+
+#### Étape 1 : alimenter le contexte GraphQL
+
+Lors de la configuration de `GraphQLModule`, exposez les données de requête dans le contexte :
+
+```ts
+GraphQLModule.forRoot({
+  autoSchemaFile: true,
+  context: ({ req, res }) => ({ req, res, requestId: req.headers['x-request-id'] }),
+});
+```
+
+Si le middleware/strategy JWT attache `req.user`, il devient disponible via
+le contexte GraphQL.
+
+#### Étape 2 : accéder au contexte dans un resolver
+
+```ts
+import { Context, Query, Resolver } from '@nestjs/graphql';
+
+@Resolver()
+export class ProfileResolver {
+  @Query(() => String)
+  me(@Context() ctx: any) {
+    return ctx.req.user?.id;
+  }
+}
+```
+
+#### Étape 3 : autoriser avec un guard GraphQL
+
+Utiliser `GqlExecutionContext` pour lire `req.user` dans les guards :
+
+```ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import { GqlExecutionContext } from '@nestjs/graphql';
+
+@Injectable()
+export class GqlAuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const gqlCtx = GqlExecutionContext.create(context);
+    const req = gqlCtx.getContext().req;
+    if (!req.user) throw new UnauthorizedException();
+    return true;
+  }
+}
+```
+
+Application :
+
+```ts
+@UseGuards(GqlAuthGuard)
+@Query(() => User)
+me(@Context() ctx: any) {
+  return ctx.req.user;
+}
+```
+
+#### Autorisation fine-grained
+
+1. Vérifications basées rôles via metadata + guard (`@Roles(...)`).
+2. Vérifications policy/ABAC via un service sujet-action-ressource.
+3. Autorisation au niveau champ dans `@ResolveField()` si nécessaire.
+
+#### Bonnes pratiques
+
+1. Garder un contexte minimal mais suffisant (user, requestId, loaders, tenant).
+2. Faire l’authentification une fois par requête, l’autorisation par opération/champ.
+3. Utiliser des DataLoaders dans le contexte pour prévenir le N+1.
+4. Ne jamais faire confiance aux identifiants utilisateur fournis par le client ; utiliser uniquement le contexte authentifié.
+
+#### Règle pratique
+
+Le contexte GraphQL est votre enveloppe de requête de confiance.
+Placez-y l’identité, puis appliquez l’autorisation avec des guards/policies
+basés sur ce contexte.
+
+</details>
+
+<details>
+<summary>86. Quels protocoles de transport et brokers de messages sont pris en charge (Kafka, Redis, gRPC, NATS) et quelles sont leurs différences ?</summary>
+
+#### NestJS
+
+Les microservices NestJS prennent en charge plusieurs transports, dont Kafka,
+Redis, gRPC et NATS. Chacun a des sémantiques de livraison, un profil de
+performance et des cas d’usage différents.
+
+#### Comparaison haut niveau
+
+1. **Kafka**
+   Broker distribué de type commit-log, avec haut débit, rétention durable,
+   groupes de consommateurs et capacité de replay.
+
+2. **Transport Redis** (pub/sub ou patterns basés streams)
+   Messagerie très rapide, simple, faible latence ; la durabilité/l’ordre dépendent
+   du pattern Redis choisi et du setup.
+
+3. **gRPC**
+   Protocole RPC sur HTTP/2 avec contrats Protobuf ; excellent pour les appels
+   synchrones service-à-service fortement typés.
+
+4. **NATS**
+   Système de messagerie léger et performant ; idéal pour pub/sub faible latence
+   et request/reply, avec persistance optionnelle via JetStream.
+
+#### Quand choisir chaque option
+
+1. **Kafka**
+   1. Event streaming et audit trails.
+   2. Pipelines asynchrones à haut débit.
+   3. Besoin de replay/historique et scaling fort des consumers.
+
+2. **Redis**
+   1. Fan-out d’événements simple et léger.
+   2. Patterns de messagerie proches du cache.
+   3. Faible overhead opérationnel pour les systèmes plus petits.
+
+3. **gRPC**
+   1. RPC interne faible latence avec contrats stricts.
+   2. Microservices polyglottes nécessitant clients/stubs générés.
+   3. Cas d’usage RPC en streaming bidirectionnel.
+
+4. **NATS**
+   1. Messagerie cloud-native rapide.
+   2. Request/reply et pub/sub avec empreinte minimale.
+   3. JetStream quand vous avez besoin de durabilité/ack/replay.
+
+#### Différences sémantiques importantes
+
+1. **Style de communication**
+   Kafka/NATS/Redis : patterns asynchrones orientés événements/messages.
+   gRPC : RPC direct request/response (orienté synchrone).
+
+2. **Durabilité/replay**
+   Kafka : log durable fort et replay par conception.
+   NATS core : éphémère sauf si JetStream activé.
+   Redis pub/sub : éphémère par défaut.
+   gRPC : pas de couche de persistance broker (sémantique d’appel RPC).
+
+3. **Modèle de contrat**
+   gRPC utilise des schémas stricts Protobuf-first.
+   Les transports orientés broker reposent souvent sur des conventions de schéma
+   de message (Avro/JSON/Protobuf) imposées par l’équipe/l’outillage.
+
+#### Guidance pratique de design NestJS
+
+1. Utiliser **gRPC** pour des APIs internes synchrones nécessitant un typage strict.
+2. Utiliser **Kafka/NATS/Redis** pour des workflows asynchrones découplés.
+3. Pour des événements métier critiques nécessitant replay/audit, préférer **Kafka**
+   ou des patterns **NATS JetStream** persistants.
+4. Standardiser les enveloppes de messages (`eventName`, `version`, `correlationId`, `payload`).
+5. Ajouter de l’observabilité pour lag, retry, DLQ et santé des consumers.
+
+#### Règle pratique
+
+Choisissez le transport d’abord selon le modèle de panne et les garanties de
+livraison, pas uniquement selon le débit brut.
+
+</details>
+
+<details>
+<summary>87. Comment concevoir correctement une architecture orientée événements et quels en sont les principes clés ?</summary>
+
+#### NestJS
+
+L’architecture orientée événements (EDA) organise les systèmes autour d’événements :
+des faits indiquant que quelque chose s’est produit (`order.created`, `payment.failed`, etc.).
+Les producteurs publient des événements ; les consommateurs réagissent de façon asynchrone.
+
+#### Principes clés
+
+1. **Faible couplage**
+   Les producteurs ne dépendent pas des détails internes des consommateurs.
+
+2. **Communication asynchrone**
+   Les services se coordonnent via événements plutôt que RPC bloquant quand possible.
+
+3. **Source de vérité unique par domaine**
+   Chaque service possède ses données et publie des événements de domaine après changement d’état.
+
+4. **Gouvernance des contrats d’événement**
+   Les événements sont des contrats versionnés avec schéma stable et sémantique claire.
+
+5. **Consommateurs idempotents**
+   Les handlers doivent traiter en sécurité des livraisons dupliquées.
+
+6. **Observabilité et traçabilité**
+   Correlation IDs, métadonnées d’événement et métriques de traitement sont obligatoires.
+
+#### Guidelines de design d’événements
+
+1. Nommer les événements comme des faits au passé : `invoice.paid`, `user.email_changed`.
+2. Inclure des métadonnées :
+   `eventId`, `eventType`, `occurredAt`, `version`, `correlationId`, `source`.
+3. Garder un payload centré sur le sens métier, pas sur la structure DB interne.
+4. Préférer une évolution additive du schéma ; éviter les changements cassants.
+
+#### Modèle de livraison et cohérence
+
+1. Supposer une livraison at-least-once dans la plupart des brokers.
+2. Utiliser la cohérence éventuelle entre frontières de services.
+3. Utiliser retries + DLQ pour les traitements en échec.
+4. Appliquer le pattern outbox pour éviter les écarts « écriture DB réussie mais publication d’événement échouée ».
+
+#### Blocs d’implémentation NestJS
+
+1. Événements internes module : `@nestjs/event-emitter` (in-process).
+2. Traitement asynchrone durable : queues Bull/BullMQ.
+3. Messagerie inter-services : adapters de transport Kafka/NATS/Redis.
+4. Handlers consommateurs avec validation + vérifications d’idempotence.
+
+#### Anti-patterns à éviter
+
+1. Payloads d’événements avec snapshots d’objets massifs et mutables.
+2. Couplage synchrone caché déguisé en événements.
+3. Absence de stratégie de versioning de schéma.
+4. Absence de plan de replay/récupération en cas d’indisponibilité consommateurs.
+5. Traiter les événements comme des commandes (sauf si explicitement modélisé).
+
+#### Flux d’architecture pratique
+
+1. Une commande met à jour l’état domaine dans le service propriétaire.
+2. Le propriétaire émet l’événement domaine (transactionnellement via outbox).
+3. Le broker livre aux consommateurs intéressés.
+4. Les consommateurs mettent à jour leurs propres read models/effets secondaires.
+5. Le monitoring suit lag, échecs et DLQ.
+
+#### Règle pratique
+
+Concevez les événements comme des faits métier durables, pas des détails d’implémentation.
+La fiabilité vient de l’idempotence, de la discipline contractuelle et de l’observabilité opérationnelle.
+
+</details>
+
+<details>
+<summary>88. Comment gérer les transactions distribuées dans les microservices ? (pattern Saga, cohérence éventuelle)</summary>
+
+#### NestJS
+
+Dans les microservices, une transaction ACID classique sur plusieurs
+services/bases est généralement impraticable. À la place, on utilise la
+**cohérence éventuelle** et des patterns de coordination comme **Saga**.
+
+#### Pourquoi les transactions distribuées sont difficiles
+
+1. Les services possèdent des bases de données séparées.
+2. Les pannes réseau et succès partiels sont normaux.
+3. Les transactions globales type 2PC réduisent la disponibilité et augmentent la complexité.
+
+#### Approche recommandée : pattern Saga
+
+Une Saga est une séquence de transactions locales entre services,
+avec des étapes pilotées par succès/échec.
+
+Deux variantes :
+1. **Choreography**
+   Les services réagissent aux événements sans coordinateur central.
+2. **Orchestration**
+   Un orchestrateur dédié pilote le flux d’étapes et les compensations.
+
+#### Concepts clés
+
+1. **Transaction locale par service**
+   Chaque service valide seulement ses propres changements DB.
+
+2. **Actions compensatoires**
+   Si une étape ultérieure échoue, les étapes précédentes sont compensées
+   (`reserve -> release`, `charge -> refund`).
+
+3. **Idempotence**
+   Les handlers/compensations doivent être sûrs en cas de retries/duplications.
+
+4. **Messages fiables**
+   Utiliser outbox + broker pour éviter la perte d’événements entre DB commit et publication.
+
+#### Exemple de flow Saga (commande)
+
+1. `order.created`
+2. Service Inventory réserve le stock -> `inventory.reserved`
+3. Service Payment débite -> `payment.completed`
+4. Service Order confirme -> `order.confirmed`
+
+Si `payment.failed` :
+1. Publier compensation `inventory.release`
+2. Marquer `order.cancelled`
+
+#### Choreography vs Orchestration
+
+1. **Choreography**
+   1. Plus décentralisée, plus simple au début.
+   2. Peut devenir difficile à suivre à grande échelle.
+
+2. **Orchestration**
+   1. Flux central explicite, meilleure visibilité de processus.
+   2. Ajoute un composant orchestrateur à maintenir.
+
+#### Building blocks NestJS
+
+1. Transports événements (Kafka/NATS/Redis) pour communication inter-services.
+2. Bull/BullMQ pour étapes asynchrones et retries.
+3. Outbox pattern pour publication d’événements fiable.
+4. DLQ + monitoring pour messages échoués.
+
+#### Bonnes pratiques
+
+1. Définir explicitement les actions compensatoires pour chaque étape.
+2. Rendre les consumers idempotents et observables (`correlationId`, `sagaId`).
+3. Fixer des timeouts et règles de retry bornées.
+4. Garder les événements versionnés et centrés métier.
+5. Tester les scénarios d’échec partiel et de replay.
+
+#### Règle pratique
+
+Dans les microservices, concevez « succès éventuel + compensation sûre », pas
+« commit global ». La robustesse vient de l’idempotence, des compensations
+et d’une orchestration/observabilité rigoureuses.
+
+</details>
+
+<details>
+<summary>89. Qu’est-ce que CQRS et comment l’implémenter dans NestJS avec @nestjs/cqrs ?</summary>
+
+#### NestJS
+
+CQRS (Command Query Responsibility Segregation) sépare les opérations d’écriture
+(commandes) des opérations de lecture (requêtes), souvent avec des modèles et des
+stratégies d’optimisation différents pour chaque côté.
+
+#### Pourquoi CQRS est utilisé
+
+1. Séparation claire des mutations métier vs préoccupations de lecture.
+2. Meilleure scalabilité pour les systèmes orientés lecture.
+3. Modélisation plus simple des workflows métier complexes.
+4. Intégration plus propre avec les événements et la cohérence éventuelle.
+
+#### Composants CQRS clés
+
+1. **Command**
+   Intention de changer l’état (`CreateOrderCommand`).
+
+2. **CommandHandler**
+   Exécute la logique métier et écrit l’état.
+
+3. **Query**
+   Demande de données sans effet de bord (`GetOrderByIdQuery`).
+
+4. **QueryHandler**
+   Retourne un modèle de lecture/projection de données.
+
+5. **Events** (optionnels mais courants)
+   Faits émis après des changements d’état réussis.
+
+#### Implémentation NestJS avec `@nestjs/cqrs`
+
+Étape 1 : installer et importer `CqrsModule`.
+
+```ts
+@Module({
+  imports: [CqrsModule],
+  providers: [CreateOrderHandler, GetOrderByIdHandler],
+})
+export class OrdersModule {}
+```
+
+Étape 2 : définir commande + handler.
+
+```ts
+export class CreateOrderCommand {
+  constructor(
+    public readonly userId: string,
+    public readonly items: Array<{ sku: string; qty: number }>,
+  ) {}
+}
+
+@CommandHandler(CreateOrderCommand)
+export class CreateOrderHandler implements ICommandHandler<CreateOrderCommand> {
+  constructor(private readonly ordersService: OrdersService) {}
+
+  async execute(command: CreateOrderCommand) {
+    return this.ordersService.create(command.userId, command.items);
+  }
+}
+```
+
+Étape 3 : définir requête + handler.
+
+```ts
+export class GetOrderByIdQuery {
+  constructor(public readonly orderId: string) {}
+}
+
+@QueryHandler(GetOrderByIdQuery)
+export class GetOrderByIdHandler implements IQueryHandler<GetOrderByIdQuery> {
+  constructor(private readonly readRepo: OrdersReadRepository) {}
+
+  async execute(query: GetOrderByIdQuery) {
+    return this.readRepo.findById(query.orderId);
+  }
+}
+```
+
+Étape 4 : utiliser les bus dans contrôleur/service.
+
+```ts
+constructor(
+  private readonly commandBus: CommandBus,
+  private readonly queryBus: QueryBus,
+) {}
+
+await this.commandBus.execute(new CreateOrderCommand(userId, items));
+return this.queryBus.execute(new GetOrderByIdQuery(orderId));
+```
+
+#### Quand CQRS vaut la peine
+
+1. Règles métier et workflows complexes.
+2. Besoins de scaling différents pour lecture vs écriture.
+3. Besoin de projections/read models orientés événements.
+
+#### Quand ne pas surutiliser CQRS
+
+1. Petites applis CRUD avec logique simple.
+2. Équipes non prêtes pour la complexité architecturale supplémentaire.
+
+#### Règle pratique
+
+Utilisez CQRS quand la complexité métier ou les besoins de scaling le justifient.
+Sinon, gardez un modèle service/repository plus simple et faites évoluer
+progressivement.
+
+</details>
+
+<details>
+<summary>90. Qu’est-ce que le Domain-Driven Design et comment ses principes sont-ils appliqués dans NestJS ?</summary>
+
+#### NestJS
+
+Le Domain-Driven Design (DDD) est une approche qui modélise le logiciel autour
+des domaines métier centraux et de leur langage, plutôt qu’autour des seules
+couches techniques.
+
+Dans NestJS, DDD s’applique en alignant les modules et frontières de code avec
+les capacités métier et les règles de domaine.
+
+#### Principes DDD clés
+
+1. **Ubiquitous language**
+   Vocabulaire métier partagé dans le code, la documentation et les échanges.
+
+2. **Bounded contexts**
+   Frontières claires où un modèle a une signification spécifique.
+
+3. **Entities / Value Objects / Aggregates**
+   Objets de domaine avec invariants explicites et règles de cohérence.
+
+4. **Domain services**
+   Opérations métier stateless qui n’appartiennent pas à une seule entité.
+
+5. **Repositories**
+   Abstractions pour charger/sauvegarder les agrégats.
+
+6. **Domain events**
+   Faits métier émis quand des changements d’état significatifs se produisent.
+
+#### Mapping vers NestJS
+
+1. **Feature modules comme bounded contexts**
+   `OrdersModule`, `BillingModule`, `InventoryModule`.
+
+2. **Services de couche application**
+   Orchestrent use cases, transactions et intégrations.
+
+3. **Couche domaine**
+   Modèle métier pur (entités/value objects/policies), indépendant du framework.
+
+4. **Adapters d’infrastructure**
+   DB, messagerie, APIs externes, contrôleurs HTTP.
+
+#### Structure de dossiers typique (exemple)
+
+```text
+orders/
+  application/
+    commands/
+    queries/
+    orders.application-service.ts
+  domain/
+    entities/
+    value-objects/
+    events/
+    repositories/
+  infrastructure/
+    persistence/
+    messaging/
+    http/
+  orders.module.ts
+```
+
+#### Bénéfices pratiques du DDD dans NestJS
+
+1. Meilleur alignement pour une logique métier complexe.
+2. Réduction du couplage accidentel entre domaines.
+3. Logique cœur plus testable, indépendante du framework/infrastructure.
+4. Évolution d’architecture plus simple à mesure que le système grandit.
+
+#### Pièges fréquents
+
+1. Appeler « DDD » n’importe quel code en couches sans vraie profondeur de modèle domaine.
+2. Faire fuiter directement les entités ORM dans la logique de domaine.
+3. Mélanger incohérentement langage technique et concepts métier.
+4. Sur-ingénierie DDD pour des services CRUD triviaux.
+
+#### Quand DDD est le plus utile
+
+1. Règles métier riches et évolutives.
+2. Plusieurs équipes/domaines sur une même plateforme.
+3. Besoin de clarté de modèle long terme et d’autonomie des bounded contexts.
+
+#### Règle pratique
+
+Appliquez DDD de façon incrémentale : commencez par des bounded contexts clairs
+et un ubiquitous language solide, puis approfondissez les patterns tactiques là
+où la complexité métier le justifie.
+
+</details>
+
+<details>
+<summary>91. Qu’est-ce que l’architecture hexagonale (Ports & Adapters) et comment l’implémenter dans NestJS ?</summary>
+
+#### NestJS
+
+L’architecture hexagonale (Ports & Adapters) structure une application pour que
+la logique métier soit isolée des technologies externes (DB, HTTP, brokers,
+SDKs).
+
+Le cœur dépend d’abstractions (ports), tandis que les intégrations concrètes
+sont des implémentations d’adapters.
+
+#### Concepts clés
+
+1. **Cœur domaine/application**
+   Règles métier et orchestration des use cases.
+
+2. **Ports**
+   Interfaces/contrats utilisés par le cœur (ports de sortie) ou exposés par lui
+   (ports d’entrée).
+
+3. **Adapters**
+   Implémentations techniques des ports :
+   contrôleurs HTTP, repositories DB, consumers de messages, clients API externes.
+
+#### Règle de dépendance
+
+Toutes les dépendances pointent vers l’intérieur :
+1. Les adapters dépendent des contrats du cœur.
+2. Le cœur ne dépend pas des détails framework/infrastructure.
+
+#### Application dans NestJS
+
+1. Définir des interfaces de ports dans la couche domaine/application.
+2. Implémenter les adapters dans la couche infrastructure.
+3. Lier les classes adapters aux tokens de ports dans les providers de module.
+4. Utiliser la DI pour injecter le port dans les services de use case.
+
+#### Forme d’exemple
+
+Port (contrat cœur) :
+
+```ts
+export interface PaymentPort {
+  charge(input: { orderId: string; amount: number }): Promise<{ paymentId: string }>;
+}
+```
+
+Service applicatif :
+
+```ts
+@Injectable()
+export class CheckoutService {
+  constructor(@Inject('PAYMENT_PORT') private readonly payments: PaymentPort) {}
+
+  async checkout(orderId: string, amount: number) {
+    return this.payments.charge({ orderId, amount });
+  }
+}
+```
+
+Implémentation adapter :
+
+```ts
+@Injectable()
+export class StripePaymentAdapter implements PaymentPort {
+  async charge(input: { orderId: string; amount: number }) {
+    // call Stripe SDK
+    return { paymentId: 'pay_123' };
+  }
+}
+```
+
+Binding provider :
+
+```ts
+{
+  provide: 'PAYMENT_PORT',
+  useClass: StripePaymentAdapter,
+}
+```
+
+#### Bénéfices
+
+1. Tests plus faciles (mock des ports en unit tests).
+2. Couplage plus faible au framework/ORM/fournisseurs externes.
+3. Refactors long terme et changements de techno plus sûrs.
+4. Frontières d’architecture plus claires pour les équipes.
+
+#### Pièges fréquents
+
+1. Confondre « couches » et vraies frontières ports/adapters.
+2. Laisser la logique métier dépendre de types ORM/HTTP.
+3. Créer trop d’abstractions prématurément pour des modules simples.
+
+#### Règle pratique
+
+Si la logique métier doit survivre à des changements d’infrastructure,
+construisez-la autour de ports stables et gardez les adapters remplaçables.
+
+</details>
+
+<details>
+<summary>92. Comment implémenter le logging structuré, et pourquoi est-ce nécessaire ?</summary>
+
+#### NestJS
+
+Le logging structuré consiste à écrire des logs sous forme d’enregistrements
+lisibles par machine (souvent JSON) avec des champs cohérents, au lieu de chaînes
+texte libres.
+
+C’est nécessaire pour la recherche, l’alerting, la corrélation et une
+observabilité fiable en production.
+
+#### Pourquoi le logging structuré est important
+
+1. Filtrage/requêtage rapide dans les plateformes de logs.
+2. Meilleur débogage incident avec IDs de corrélation.
+3. Dashboards et alertes cohérents.
+4. Traçage inter-services plus simple dans les systèmes distribués.
+
+#### Que mettre dans chaque log
+
+1. `timestamp`
+2. `level` (`debug`, `info`, `warn`, `error`)
+3. `service` / `env`
+4. `message`
+5. `requestId` / `traceId`
+6. Champs de contexte (`userId`, `route`, `method`, `statusCode`, latence)
+7. Détails d’erreur (`errorName`, `stack`) pour les échecs
+
+#### Approche d’implémentation NestJS
+
+1. Utiliser un logger structuré (Pino/Winston) comme logger d’app.
+2. Attacher le contexte de requête (`requestId`, infos user) via middleware/interceptor.
+3. Logger événements métier et échecs avec un schéma cohérent.
+4. Éviter les `console.log` ad hoc en code production.
+
+#### Style d’exemple pratique
+
+```json
+{
+  "level": "info",
+  "message": "order.created",
+  "service": "orders-api",
+  "requestId": "5e8f...",
+  "orderId": "ord_123",
+  "userId": "usr_77",
+  "durationMs": 42
+}
+```
+
+#### Guidance de logging d’erreurs
+
+1. Garder la stack trace complète dans les logs.
+2. Ne pas exposer les stack traces dans les réponses API.
+3. Ajouter des codes d’erreur domaine pour un routage d’alerte fiable.
+4. Préserver la chaîne de cause racine lors du wrapping des exceptions.
+
+#### Erreurs fréquentes
+
+1. Logger des chaînes simples sans champs de contexte.
+2. Incohérence des noms de champs entre modules/services.
+3. Logger secrets/tokens/PII sans masquage.
+4. Bruit debug excessif sur les hot paths en production.
+
+#### Bonnes pratiques
+
+1. Définir et documenter un schéma de logs.
+2. Masquer centralement les champs sensibles.
+3. Utiliser les niveaux de log avec intention.
+4. Corréler logs avec métriques et traces.
+5. Valider la sortie logging en tests d’intégration sur les flux critiques.
+
+#### Règle pratique
+
+Si les logs sont faits seulement pour les humains, la réponse incident sera lente.
+S’ils sont structurés pour machines et humains, les opérations deviennent
+prévisibles et scalables.
+
+</details>
+
+<details>
+<summary>93. Comment implémenter le monitoring de santé applicative dans NestJS ? (@nestjs/terminus)</summary>
+
+#### NestJS
+
+Le monitoring de santé applicative dans NestJS s’implémente couramment avec
+`@nestjs/terminus`, qui fournit des endpoints standardisés pour la santé de l’app
+et la readiness/liveness des dépendances.
+
+#### Pourquoi le monitoring de santé est nécessaire
+
+1. Les orchestrateurs/load balancers ont besoin de signaux de santé.
+2. Détection d’incident plus rapide et récupération automatisée.
+3. Rollouts de déploiement sûrs et gating de readiness.
+
+#### Endpoints de santé typiques
+
+1. **Liveness** (`/health/live`)
+   Vérifie « le process tourne ».
+
+2. **Readiness** (`/health/ready`)
+   Vérifie « peut servir du trafic maintenant », dépendances critiques incluses.
+
+#### Étapes de setup de base
+
+1. Installer `@nestjs/terminus`.
+2. Importer `TerminusModule`.
+3. Créer `HealthController` avec `HealthCheckService`.
+
+#### Exemple de contrôleur
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import {
+  HealthCheck,
+  HealthCheckService,
+  HttpHealthIndicator,
+  MemoryHealthIndicator,
+} from '@nestjs/terminus';
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly http: HttpHealthIndicator,
+    private readonly memory: MemoryHealthIndicator,
+  ) {}
+
+  @Get('live')
+  @HealthCheck()
+  live() {
+    return this.health.check([
+      () => this.memory.checkHeap('memory_heap', 300 * 1024 * 1024),
+    ]);
+  }
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.http.pingCheck('docs', 'https://example.com/health'),
+    ]);
+  }
+}
+```
+
+#### Que mettre dans la readiness
+
+1. Connectivité DB.
+2. Connectivité Redis/cache.
+3. Dépendances externes critiques (si réellement nécessaires pour servir du trafic).
+4. Seuils de ressources internes (mémoire, pression event-loop si pertinent).
+
+#### Bonnes pratiques opérationnelles
+
+1. Garder la liveness légère et locale.
+2. Garder la readiness dépendance-aware mais rapide.
+3. Ne pas inclure des services optionnels non critiques dans les critères d’échec readiness.
+4. Sécuriser/limiter les détails de santé en environnements publics.
+5. Intégrer avec probes Kubernetes et alerting.
+
+#### Règle pratique
+
+La liveness dit « redémarre-moi si je suis mort ».
+La readiness dit « route du trafic vers moi seulement quand je peux servir
+les requêtes en sécurité ».
+
+</details>
+
+<details>
+<summary>94. Comment implémenter des health checks pour les services dépendants (DB, Redis, APIs externes) ?</summary>
+
+#### NestJS
+
+Les health checks de dépendances vérifient si les systèmes externes critiques sont
+assez disponibles pour que votre application serve le trafic en sécurité.
+
+Dans NestJS, cela s’implémente typiquement avec les indicateurs `@nestjs/terminus`.
+
+#### Catégories de dépendances à vérifier
+
+1. **Base de données** (critique pour la readiness de la plupart des APIs).
+2. **Redis/cache** (sessions, rate limit, queues, cache).
+3. **APIs externes critiques** (paiement, auth, etc.).
+
+#### Pattern recommandé : séparer liveness et readiness
+
+1. **Liveness**
+   Vérification locale minimale : process vivant.
+   Ne pas faire échouer pour une panne externe passagère.
+
+2. **Readiness**
+   Vérifier uniquement les dépendances nécessaires pour servir correctement.
+   Si une dépendance critique échoue -> renvoyer non-ready.
+
+#### Exemple de setup Terminus
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import {
+  HealthCheck,
+  HealthCheckService,
+  HttpHealthIndicator,
+  TypeOrmHealthIndicator,
+} from '@nestjs/terminus';
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly db: TypeOrmHealthIndicator,
+    private readonly http: HttpHealthIndicator,
+  ) {}
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.db.pingCheck('database'),
+      () => this.http.pingCheck('payments-api', 'https://payments.example.com/health'),
+    ]);
+  }
+}
+```
+
+Pour Redis, utilisez un indicator adapté (selon client/adapter choisi) ou
+un custom indicator qui fait un ping léger avec timeout court.
+
+#### Design decisions importantes
+
+1. **Critique vs optionnel**
+   Échouer readiness seulement pour les dépendances vraiment critiques.
+
+2. **Timeouts stricts**
+   Les checks doivent être rapides (ex. 100–500ms selon infra).
+
+3. **Dégradation gracieuse**
+   Si un service non essentiel est indisponible, continuer à servir si possible.
+
+4. **Pas d’opérations lourdes**
+   Les checks ne doivent pas déclencher de requêtes coûteuses.
+
+#### Bonnes pratiques opérationnelles
+
+1. Retourner une réponse structurée avec statut par dépendance.
+2. Ajouter métriques/alertes sur échecs de checks.
+3. Éviter de divulguer des détails sensibles sur endpoints publics.
+4. Aligner probes Kubernetes :
+   liveness -> `/health/live`, readiness -> `/health/ready`.
+5. Tester des modes de panne (DB down, Redis timeout, API 5xx).
+
+#### Erreurs fréquentes
+
+1. Mettre toutes les dépendances en bloquantes même si non critiques.
+2. Utiliser des timeouts longs qui ralentissent les probes.
+3. Coupler liveness à des checks externes.
+4. Oublier la logique de retry/backoff côté appelant en cas de non-ready transitoire.
+
+#### Règle pratique
+
+Les health checks doivent répondre :
+1. « Le process est-il vivant ? » (liveness)
+2. « Peut-il servir correctement maintenant ? » (readiness)
+
+Concevez-les minimalistes, rapides et orientés opérations.
+
+</details>
+
+<details>
+<summary>95. Comment utiliser OpenTelemetry dans NestJS ?</summary>
+
+#### NestJS
+
+OpenTelemetry (OTel) dans NestJS sert à collecter traces, métriques et logs pour
+l’observabilité. Le point de départ le plus courant est le tracing distribué pour
+les requêtes entrantes et les appels aval.
+
+#### Ce qu’OpenTelemetry vous apporte
+
+1. Traces end-to-end des requêtes entre services.
+2. Décomposition de latence par spans (DB, HTTP, cache, queue).
+3. Corrélation entre erreurs et dépendances spécifiques.
+4. Format de télémétrie neutre vis-à-vis du vendor (export vers Jaeger/Tempo/Datadog/New Relic, etc.).
+
+#### Flux typique de setup OTel dans NestJS
+
+1. Initialiser le SDK OTel avant le bootstrap de l’app.
+2. Configurer les attributs de ressource (`service.name`, `service.version`, env).
+3. Activer les auto-instrumentations (HTTP, Express, clients DB, etc.).
+4. Exporter les traces via OTLP/collector.
+5. Ajouter des spans custom là où le contexte métier est important.
+
+#### Bootstrap conceptuel minimal (Node SDK)
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { Resource } from '@opentelemetry/resources';
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    'service.name': 'nestjs-api',
+    'service.version': '1.0.0',
+    'deployment.environment': process.env.NODE_ENV ?? 'development',
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+Puis démarrer l’app Nest normalement.
+
+#### Exemple de span custom (frontière métier)
+
+1. Démarrer un span autour d’une opération de domaine critique.
+2. Attacher des attributs (`order.id`, `tenant.id`).
+3. Enregistrer exceptions et statut en cas d’échec.
+
+#### Bonnes pratiques pratiques
+
+1. Faire un sampling intelligent (complet en staging, sampling ajusté en production).
+2. Propager les headers de contexte (`traceparent`) entre frontières HTTP/message.
+3. Éviter les attributs à forte cardinalité (email utilisateur, IDs aléatoires dans labels).
+4. Instrumenter les dépendances critiques et consumers de queues.
+5. Corréler les traces avec les logs via trace/span IDs.
+
+#### Pièges fréquents
+
+1. Initialiser OTel après le démarrage app (perte des spans précoces).
+2. Sur-instrumentation générant overhead/bruit.
+3. Propagation de contexte manquante entre services/workers.
+4. Envoi direct de télémétrie depuis l’app sans collector dans les grands déploiements.
+
+#### Règle pratique
+
+Commencez avec tracing + auto-instrumentation, puis ajoutez des spans custom
+ciblés autour des opérations métier à forte valeur et des hotspots de latence.
+
+</details>
+
+<details>
+<summary>96. Qu’est-ce que le distributed tracing et comment est-il implémenté dans une architecture microservices ?</summary>
+
+#### NestJS
+
+Le distributed tracing suit une requête/transaction à travers plusieurs services
+et composants d’infrastructure, en montrant le flux end-to-end et la décomposition
+de latence.
+
+C’est essentiel en microservices, où une seule action utilisateur peut déclencher
+plusieurs appels de services, sauts de queue et opérations DB.
+
+#### Concepts clés du tracing
+
+1. **Trace**
+   Chemin complet de requête end-to-end.
+
+2. **Span**
+   Une opération dans la trace (appel HTTP, requête DB, exécution handler).
+
+3. **Propagation de contexte**
+   Transmission du contexte de trace entre services (ex. header `traceparent`).
+
+4. **Relations parent-enfant**
+   Les spans forment un arbre représentant la hiérarchie des appels.
+
+#### Pourquoi le distributed tracing est nécessaire
+
+1. Identifier les vrais goulots d’étranglement (quelle dépendance est lente).
+2. Déboguer rapidement les échecs inter-services.
+3. Comprendre les comportements fan-out/fan-in et tempêtes de retries.
+4. Améliorer p95/p99 avec des preuves, pas des suppositions.
+
+#### Implémentation en architecture microservices
+
+1. Instrumenter chaque service avec le SDK OpenTelemetry.
+2. Auto-instrumenter frameworks/librairies (serveur/client HTTP, DB, clients message).
+3. Propager le contexte entre frontières :
+   1. Headers HTTP (`traceparent`, `tracestate`)
+   2. Métadonnées de message pour Kafka/NATS/queues
+4. Exporter les spans vers collector/backend (OTLP -> Jaeger/Tempo/Datadog/etc.).
+5. Corréler les logs avec traceId/spanId.
+
+#### Points d’implémentation spécifiques NestJS
+
+1. Initialiser OTel avant le bootstrap Nest.
+2. Instrumenter les requêtes entrantes (Express/Fastify).
+3. Instrumenter `HttpService` sortant et drivers DB.
+4. Ajouter des spans custom autour des opérations métier importantes.
+5. Propager le contexte vers workers/jobs en arrière-plan.
+
+#### Trace typique en pratique
+
+1. API Gateway reçoit la requête (span racine).
+2. Service A valide l’auth (span enfant).
+3. Service A appelle Service B via gRPC/HTTP (span enfant).
+4. Service B interroge la DB (span imbriqué).
+5. Service B publie un événement au broker (span enfant).
+6. Un worker consomme l’événement et exécute un effet secondaire (contexte lié/continué).
+
+#### Bonnes pratiques
+
+1. Utiliser un nommage de service et des attributs de ressource cohérents.
+2. Éviter les attributs de span à forte cardinalité.
+3. Ajuster la politique de sampling (tail-based/head-based selon profil trafic).
+4. Capturer erreurs et status codes sur les spans.
+5. Aligner la rétention des traces avec les besoins d’incident/debug.
+
+#### Règle pratique
+
+En microservices, les métriques vous disent qu’un élément est lent ;
+le distributed tracing vous dit exactement où et pourquoi.
+
+</details>
+
+<details>
+<summary>97. Comment écrire des tests unitaires dans NestJS, et quelles sont les approches de base du testing ?</summary>
+
+#### NestJS
+
+Le test unitaire dans NestJS consiste à tester le comportement d’une classe/module
+isolé, généralement avec des dépendances mockées et sans appels réels réseau/DB.
+
+#### Niveaux de test principaux dans NestJS
+
+1. **Tests unitaires**
+   Testent services/guards/pipes/interceptors en isolation.
+
+2. **Tests d’intégration**
+   Testent l’interaction entre composants/modules (souvent avec DB de test).
+
+3. **Tests E2E**
+   Testent le comportement HTTP complet via bootstrap réel de l’app Nest.
+
+#### Stack typique de test unitaire
+
+1. Jest comme runner/assertion/mocking tool.
+2. `@nestjs/testing` pour créer des modules de test.
+3. Mock providers pour les dépendances (`useValue`, `useFactory`).
+
+#### Exemple de test unitaire pour un service
+
+```ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { NotFoundException } from '@nestjs/common';
+
+describe('UsersService', () => {
+  let service: UsersService;
+  const repoMock = {
+    findById: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: 'USERS_REPOSITORY', useValue: repoMock },
+      ],
+    }).compile();
+
+    service = module.get(UsersService);
+    jest.clearAllMocks();
+  });
+
+  it('returns user when found', async () => {
+    repoMock.findById.mockResolvedValue({ id: 'u1', email: 'a@example.com' });
+    await expect(service.getById('u1')).resolves.toEqual({
+      id: 'u1',
+      email: 'a@example.com',
+    });
+  });
+
+  it('throws NotFoundException when user is missing', async () => {
+    repoMock.findById.mockResolvedValue(null);
+    await expect(service.getById('missing')).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+#### Approches de testing de base
+
+1. **Arrange-Act-Assert**
+   Garder les tests lisibles et déterministes.
+
+2. **Mocker les frontières externes**
+   DB, clients HTTP, queues et systèmes dépendants du temps.
+
+3. **Tester le comportement, pas les détails d’implémentation**
+   Vérifier résultats et effets secondaires, pas les internes privés.
+
+4. **Couvrir happy path + failure path**
+   Erreurs de validation, exceptions, cas limites.
+
+#### Que tester en priorité en unitaire dans NestJS
+
+1. Services application/domaine.
+2. Guards/pipes/interceptors custom.
+3. Classes utilitaires/logique domaine.
+4. Logique de mapping/validation avec branches.
+
+#### Erreurs fréquentes
+
+1. Appeler une vraie DB dans des tests « unitaires ».
+2. Over-mocking au point de perdre de la valeur.
+3. Assertions trop strictes sur des appels internes fragiles.
+4. Ignorer les scénarios négatifs/erreurs.
+
+#### Règle pratique
+
+Les tests unitaires doivent être rapides, isolés et déterministes.
+Utilisez-les pour verrouiller le comportement de la logique métier ; utilisez
+les tests d’intégration/e2e pour valider le wiring et la réalité runtime.
+
+</details>
+
+<details>
+<summary>98. Comment mocker correctement les dépendances dans NestJS, et quand faut-il le faire ?</summary>
+
+#### NestJS
+
+Mocker des dépendances dans NestJS signifie remplacer les collaborateurs réels
+(repositories DB, clients HTTP, queues, SDKs externes) par des test doubles
+contrôlés pour isoler le comportement unitaire.
+
+#### Quand il faut mocker
+
+1. Tests unitaires de services/guards/pipes/interceptors.
+2. Tests de chemins d’échec difficiles à déclencher avec les systèmes réels.
+3. Boucles de feedback rapides où l’I/O externe ralentirait les tests.
+
+#### Quand il ne faut pas mocker
+
+1. Tests d’intégration validant le wiring des modules et adapters réels.
+2. Tests E2E validant le comportement runtime complet.
+3. Cas où le risque de dérive de contrat est élevé et où l’interaction réelle compte.
+
+#### Pattern courant de mocking dans NestJS
+
+Utiliser `TestingModule` et override les tokens provider avec `useValue`/`useFactory`.
+
+```ts
+import { Test } from '@nestjs/testing';
+
+describe('UsersService', () => {
+  let service: UsersService;
+  const usersRepoMock = {
+    findById: jest.fn(),
+    save: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: 'USERS_REPOSITORY', useValue: usersRepoMock },
+      ],
+    }).compile();
+
+    service = moduleRef.get(UsersService);
+    jest.clearAllMocks();
+  });
+});
+```
+
+#### Conseils de mocking par type de dépendance
+
+1. **Repository/DAO**
+   Mocker les méthodes spécifiques utilisées dans le test (`findOne`, `save`, etc.).
+
+2. **HttpService / client externe**
+   Mocker valeurs de retour/erreurs et scénarios timeout.
+
+3. **Publishers de queue/événements**
+   Mocker les appels enqueue/publish et vérifier payloads/contrats.
+
+4. **ConfigService**
+   Mocker explicitement les clés utilisées sur le chemin testé.
+
+#### Bonnes pratiques de mocking
+
+1. Mocker seulement les dépendances de frontière, pas la classe testée.
+2. Garder les mocks minimaux et centrés comportement.
+3. Réinitialiser les mocks entre les tests.
+4. Asserter d’abord les résultats, ensuite les interactions.
+5. Inclure explicitement les chemins négatifs (throws/rejects).
+
+#### Erreurs fréquentes
+
+1. Over-mocking des méthodes internes de la même classe (tests des détails d’implémentation).
+2. Réutiliser des mocks stateful entre cas de test sans reset.
+3. Valeurs mock qui violent la forme réelle du contrat (fausse confiance).
+4. Écrire uniquement des happy-path tests.
+
+#### Règle pratique
+
+Mockez pour isoler la logique métier et accélérer les tests unitaires.
+Utilisez les tests d’intégration/e2e pour vérifier le wiring réel
+et les contrats externes.
+
+</details>
+
+<details>
+<summary>99. Comment écrire des tests d’intégration dans NestJS avec TestingModule ?</summary>
+
+#### NestJS
+
+Les tests d’intégration dans NestJS vérifient l’interaction réelle entre plusieurs
+composants (services, repositories, guards, modules), sans mocker tout le graphe
+comme en test unitaire.
+
+Ils se situent entre tests unitaires (isolés) et tests E2E (application complète
+via HTTP).
+
+#### Objectif des tests d’intégration
+
+1. Valider le wiring DI/module.
+2. Vérifier l’intégration service-repository/adapters.
+3. Détecter les erreurs de configuration runtime tôt.
+
+#### Pattern de base avec `TestingModule`
+
+1. Construire un module de test proche du module réel.
+2. Garder seulement les dépendances externes vraiment coûteuses mockées (ex. API tierce).
+3. Utiliser une DB de test (ou in-memory) pour la persistance.
+
+#### Exemple conceptuel
+
+```ts
+import { Test, TestingModule } from '@nestjs/testing';
+
+describe('OrdersService (integration)', () => {
+  let moduleRef: TestingModule;
+  let service: OrdersService;
+
+  beforeAll(async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [OrdersModule, TestDatabaseModule],
+    }).compile();
+
+    service = moduleRef.get(OrdersService);
+  });
+
+  afterAll(async () => {
+    await moduleRef.close();
+  });
+
+  it('creates order and persists it', async () => {
+    const created = await service.create({ userId: 'u1', items: [{ sku: 'A', qty: 1 }] });
+    const loaded = await service.getById(created.id);
+
+    expect(loaded.id).toBe(created.id);
+    expect(loaded.items).toHaveLength(1);
+  });
+});
+```
+
+#### Choix de base de données de test
+
+1. **In-memory DB** (rapide pour tests locaux).
+2. **Containerized DB** (plus réaliste, meilleur signal de prod).
+3. Nettoyer l’état entre tests (transactions/fixtures/truncate).
+
+#### Bonnes pratiques
+
+1. Tester des flux métier traversant plusieurs couches.
+2. Garder des fixtures de données minimales et explicites.
+3. Assurer l’isolation des tests (pas de dépendance à l’ordre d’exécution).
+4. Inclure chemins d’échec (conflits, violations contraintes, timeouts).
+5. Exécuter en CI avec environnement reproductible.
+
+#### Différence vs unit/E2E
+
+1. **Unit** : classe isolée, dépendances mockées.
+2. **Integration** : plusieurs composants réels, I/O partiel réel.
+3. **E2E** : app entière + couche HTTP.
+
+#### Erreurs fréquentes
+
+1. Trop de mocks (perte de valeur d’intégration).
+2. État DB non reset entre tests.
+3. Dépendance à des services externes instables en CI.
+4. Tests lents à cause de fixtures lourdes.
+
+#### Règle pratique
+
+Utilisez les tests d’intégration pour prouver que les composants collaborent
+correctement en runtime réel. Gardez-les moins nombreux que les unit tests,
+mais plus proches de la réalité.
+
+</details>
+
+<details>
+<summary>100. Qu’est-ce que le test end-to-end (E2E) dans NestJS, et en quoi diffère-t-il des tests unitaires et d’intégration ?</summary>
+
+#### NestJS
+
+Le test E2E (end-to-end) dans NestJS vérifie le comportement complet de
+l’application via les interfaces publiques réelles (généralement HTTP), au plus
+proche de l’usage réel par les clients.
+
+C’est le niveau de test le plus fiable pour valider les contrats API,
+middleware/guards, validation, mapping des erreurs et wiring d’infrastructure.
+
+#### Différences entre E2E et autres niveaux de test
+
+1. **Tests unitaires**
+   Testent une classe isolée avec dépendances mockées.
+
+2. **Tests d’intégration**
+   Testent la collaboration de plusieurs composants/modules réels.
+
+3. **Tests E2E**
+   Testent le chemin complet requête -> pipeline framework -> logique métier ->
+   persistance -> réponse.
+
+#### Setup E2E typique dans NestJS
+
+1. Créer un module de test avec `AppModule` complet (ou quasi complet).
+2. Bootstrap une instance d’application Nest.
+3. Envoyer de vraies requêtes HTTP (souvent via `supertest`).
+4. Asserter codes de statut, corps de réponse et effets secondaires.
+
+#### Exemple E2E minimal
+
+```ts
+import { Test } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import request from 'supertest';
+
+describe('Users E2E', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('POST /users creates a user', async () => {
+    await request(app.getHttpServer())
+      .post('/users')
+      .send({ email: 'e2e@example.com', password: 'secret123' })
+      .expect(201)
+      .expect(res => {
+        expect(res.body.email).toBe('e2e@example.com');
+      });
+  });
+});
+```
+
+#### Ce que l’E2E détecte le mieux
+
+1. Configuration cassée de route/guard/pipe/interceptor.
+2. Mismatchs validation et sérialisation.
+3. Régressions de flux d’auth.
+4. Dérive réelle du contrat API.
+5. Problèmes de gestion d’erreurs globales et forme de réponse.
+
+#### Pièges fréquents
+
+1. S’appuyer uniquement sur l’E2E (trop lent pour couvrir toute la logique).
+2. Exécuter sur des environnements partagés non isolés.
+3. Setup/cleanup de données instable causant des tests flaky.
+4. Suite E2E trop large, lente et difficile à maintenir.
+
+#### Pyramide de test pratique
+
+1. Beaucoup de tests unitaires (confiance logique rapide).
+2. Quelques tests d’intégration (confiance wiring).
+3. Moins de tests E2E, mais à forte valeur (confiance contrat).
+
+</details>
+
+<details>
+<summary>101. Qu’est-ce que Nest CLI et quelles commandes sont les plus utilisées ?</summary>
+
+#### NestJS
+
+Nest CLI est l’outil officiel en ligne de commande pour créer, générer, exécuter
+et maintenir des applications NestJS.
+
+Il standardise le scaffolding du projet et accélère le développement quotidien.
+
+#### À quoi sert Nest CLI
+
+1. Créer de nouveaux projets avec une structure recommandée.
+2. Générer rapidement modules/controllers/services/resources.
+3. Exécuter l’app en mode dev/watch.
+4. Construire les bundles de production.
+5. Lancer les tests via scripts/outillage configurés.
+
+#### Commandes les plus utilisées
+
+1. **Créer une app**
+   `nest new my-app`
+
+2. **Exécuter en développement**
+   `npm run start:dev`
+   (ou `nest start --watch` selon le setup)
+
+3. **Build de l’app**
+   `npm run build`
+   (ou `nest build`)
+
+4. **Générer un module**
+   `nest g module users`
+
+5. **Générer un controller**
+   `nest g controller users`
+
+6. **Générer un service**
+   `nest g service users`
+
+7. **Générer une resource CRUD complète**
+   `nest g resource users`
+
+8. **Lancer les tests**
+   `npm test`, `npm run test:watch`, `npm run test:e2e`
+
+#### Alias de commandes utiles
+
+1. `nest generate` -> `nest g`
+2. `nest controller` -> `nest g co`
+3. `nest service` -> `nest g s`
+4. `nest module` -> `nest g mo`
+
+#### Exemple de workflow pratique
+
+1. `nest g resource orders`
+2. Implémenter la logique domaine/use-case.
+3. `npm run start:dev` pour itération locale.
+4. `npm run test` et `npm run test:e2e`.
+5. `npm run build` avant release.
+
+#### Bonnes pratiques
+
+1. Utiliser les générateurs CLI pour garder une structure cohérente dans l’équipe.
+2. Revoir le code généré et supprimer le boilerplate inutile.
+3. Préférer des frontières d’architecture explicites plutôt qu’un layering généré aveuglément.
+4. Garder les scripts `package.json` alignés avec le workflow CI de l’équipe.
+
+#### Règle pratique
+
+Nest CLI est un outil de productivité, pas une architecture.
+Utilisez-le pour scaffold rapidement, puis façonnez la base de code selon votre
+domaine et vos standards de qualité.
+
+</details>
+
+<details>
+<summary>102. Comment organiser correctement un Dockerfile pour une application NestJS (build multi-stage) ?</summary>
+
+#### NestJS
+
+Un Dockerfile multi-stage correct pour NestJS sépare les dépendances de build
+et l’image runtime, ce qui donne des conteneurs de production plus petits,
+plus sûrs et plus rapides.
+
+#### Pourquoi le build multi-stage est important
+
+1. Taille finale d’image plus petite.
+2. Surface d’attaque réduite (pas d’outillage dev/build en runtime).
+3. Temps de déploiement/pull plus rapides.
+4. Frontières de dépendances plus propres.
+
+#### Structure multi-stage recommandée
+
+1. **stage deps**
+   Installer les dépendances avec lockfile.
+
+2. **stage build**
+   Compiler TypeScript -> `dist`.
+
+3. **stage runtime**
+   Copier uniquement la sortie compilée + dépendances de production.
+
+#### Exemple de Dockerfile
+
+```dockerfile
+# -------- deps --------
+FROM node:20-alpine AS deps
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+# -------- build --------
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# -------- runtime --------
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /app/dist ./dist
+
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+#### `.dockerignore` recommandé
+
+1. `node_modules`
+2. `dist`
+3. `.git`
+4. `coverage`
+5. fichiers env locaux non requis dans le contexte de build
+
+#### Bonnes pratiques sécurité et runtime
+
+1. Exécuter en utilisateur non-root quand possible.
+2. Pinner la version majeure Node et garder les images de base à jour.
+3. Injecter la config via variables d’environnement/secret manager, pas via fichiers embarqués.
+4. Utiliser health checks et support d’arrêt gracieux.
+5. Scanner l’image pour vulnérabilités en CI.
+
+#### Conseils de performance du build
+
+1. Copier les lockfiles tôt pour profiter du cache de couches.
+2. Éviter d’invalider la couche de dépendances par des changements fréquents de source uniquement.
+3. Utiliser des installs déterministes (`npm ci`).
+
+#### Erreurs fréquentes
+
+1. Image single-stage avec toutes les dépendances de dev.
+2. Livrer code source et outils de build dans l’image runtime.
+3. Copier tout le contexte avant l’installation des dépendances (casse l’efficacité du cache).
+4. Stocker des secrets dans le Dockerfile ou un `.env` commité.
+
+#### Règle pratique
+
+Build lourd dans les premiers stages, runtime léger dans le stage final.
+Le conteneur de production doit contenir uniquement le nécessaire pour exécuter
+`dist/main.js`.
+
+</details>
