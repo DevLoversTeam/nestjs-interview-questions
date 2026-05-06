@@ -7513,3 +7513,158 @@ Mockear bien en NestJS acelera tests y mejora foco en comportamiento de la unida
 Hazlo para aislamiento; evita abuso cuando necesitas validar integración real.
 
 </details>
+
+<details>
+<summary>99. ¿Cómo escribir integration tests en NestJS usando TestingModule?</summary>
+
+#### NestJS / Testing
+
+Los **integration tests** verifican que varios componentes reales trabajen juntos
+(módulo, providers, repositorios, DB de prueba), sin llegar al nivel full E2E.
+
+#### Qué validan
+
+1. Wiring real de dependencias en módulo.
+2. Colaboración service + repository + infraestructura.
+3. Errores de configuración que unit tests con mocks no detectan.
+
+#### Patrón con `TestingModule`
+
+1. Crear módulo de prueba con imports reales.
+2. Usar DB de test (sqlite/memory/testcontainer).
+3. Ejecutar casos sobre providers reales.
+
+#### Ejemplo conceptual
+
+```ts
+import { Test } from '@nestjs/testing';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+describe('UsersService (integration)', () => {
+  let moduleRef;
+  let service: UsersService;
+
+  beforeAll(async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [
+        TypeOrmModule.forRoot({
+          type: 'sqlite',
+          database: ':memory:',
+          dropSchema: true,
+          entities: [UserEntity],
+          synchronize: true,
+        }),
+        TypeOrmModule.forFeature([UserEntity]),
+      ],
+      providers: [UsersService],
+    }).compile();
+
+    service = moduleRef.get(UsersService);
+  });
+
+  afterAll(async () => {
+    await moduleRef.close();
+  });
+
+  it('creates and fetches user', async () => {
+    const created = await service.create({ email: 'u@test.com', password: 'secret123' });
+    const found = await service.getById(created.id);
+
+    expect(found.email).toBe('u@test.com');
+  });
+});
+```
+
+#### Buenas prácticas
+
+1. Aislar estado entre tests (transacción rollback o reset DB).
+2. No mockear capa que quieres validar.
+3. Mantener fixtures simples y reproducibles.
+4. Correr integration tests en CI.
+
+#### Unit vs Integration (rápido)
+
+1. Unit: rápido, aislado, mocks.
+2. Integration: más lento, más real, detecta errores de wiring/persistencia.
+
+#### Conclusión
+
+Integration tests con `TestingModule` cierran la brecha entre unit y E2E,
+asegurando que módulos NestJS funcionen correctamente en condiciones cercanas a producción.
+
+</details>
+
+<details>
+<summary>100. ¿Qué es testing end-to-end (E2E) en NestJS y en qué se diferencia de unit e integration tests?</summary>
+
+#### NestJS / Testing
+
+Los **E2E tests** validan el sistema completo desde la entrada HTTP hasta la
+respuesta final, incluyendo middleware, guards, pipes, controllers, services,
+persistencia y configuración realista.
+
+#### Diferencia entre niveles
+
+1. **Unit**
+   Prueba una unidad aislada con mocks.
+
+2. **Integration**
+   Prueba colaboración entre componentes/módulos reales.
+
+3. **E2E**
+   Prueba flujo completo de la app como lo ve un cliente.
+
+#### Qué detecta E2E que otros no
+
+1. Errores de routing/bootstrap global.
+2. Problemas de middleware/guard/pipe en cadena real.
+3. Contrato HTTP real (status, headers, body).
+4. Fallos de configuración entre módulos.
+
+#### Patrón típico en NestJS (`supertest`)
+
+```ts
+import { INestApplication } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import request from 'supertest';
+
+describe('Users E2E', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('/users (POST) creates user', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/users')
+      .send({ email: 'e2e@test.com', password: 'secret123' })
+      .expect(201);
+
+    expect(res.body.email).toBe('e2e@test.com');
+  });
+});
+```
+
+#### Buenas prácticas
+
+1. Ejecutar E2E contra entorno de test aislado.
+2. Preparar/limpiar datos por suite.
+3. Cubrir flujos críticos (auth, pagos, creación de pedidos).
+4. Mantener número razonable (E2E son más lentos).
+
+#### Conclusión
+
+Unit da velocidad, integration valida wiring, E2E asegura comportamiento real del
+producto. Los tres niveles son complementarios, no excluyentes.
+
+</details>
