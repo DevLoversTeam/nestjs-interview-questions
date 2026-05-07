@@ -6177,12 +6177,147 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Автентифікацію WebSocket у NestJS зазвичай виконують під час handshake, а потім
+додатково перевіряють на рівні кожної події через guards/перевірки авторизації.
+
+#### Типовий флоу автентифікації
+
+1. Клієнт передає токен (JWT/session) у handshake:
+   `auth`, headers або query params (краще `auth`/headers).
+2. Сервер валідує токен у gateway middleware/guard.
+3. Контекст автентифікованого користувача додається в socket (`client.data.user`).
+4. Наступні message handlers використовують цей контекст для авторизації.
+
+#### Приклад: автентифікація під час підключення
+
+```ts
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  SubscribeMessage,
+  WebSocketGateway,
+} from '@nestjs/websockets';
+import { UnauthorizedException, UseGuards } from '@nestjs/common';
+import { Socket } from 'socket.io';
+
+@WebSocketGateway({ namespace: '/chat', cors: { origin: ['https://app.example.com'] } })
+export class ChatGateway implements OnGatewayConnection {
+  constructor(private readonly authService: AuthService) {}
+
+  async handleConnection(client: Socket) {
+    const token =
+      client.handshake.auth?.token ||
+      (client.handshake.headers.authorization as string | undefined)?.replace('Bearer ', '');
+
+    if (!token) throw new UnauthorizedException('Missing token');
+
+    const user = await this.authService.verifyAccessToken(token); // кидає помилку, якщо токен невалідний
+    client.data.user = user;
+  }
+
+  @SubscribeMessage('chat.send')
+  async onSend(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { roomId: string; text: string },
+  ) {
+    const user = client.data.user;
+    // тут перевіряємо доступ користувача до room
+    return { ok: true, userId: user.id, text: payload.text };
+  }
+}
+```
+
+#### Авторизація подій через guard
+
+1. Використовуйте `WsGuard`, щоб валідувати auth context для кожної події.
+2. Комбінуйте з role/policy checks (членство в room, tenant scope, permissions).
+
+#### Best practices безпеки
+
+1. Віддавайте перевагу короткоживучим access tokens.
+2. Для чутливих подій повторно перевіряйте авторизацію, не лише при connect.
+3. Обробляйте expiry/revocation токена (disconnect або повторна автентифікація).
+4. Не довіряйте user ID, надісланому клієнтом у payload; використовуйте auth context socket.
+5. Додавайте throttling/rate limits для чутливих до auth подій.
+
+#### Нотатки про масштабування
+
+1. У multi-instance сетапах використовуйте спільну стратегію перевірки session/token.
+2. Якщо presence/rooms розподілені, використовуйте Redis adapter для синхронізації state між нодами.
+
+#### Правило
+
+Автентифікацію робіть один раз під час handshake (ефективність), а
+авторизацію — на кожній події (безпека). Потрібні обидва рівні.
+
 </details>
 
 <details>
 <summary>82. Які підходи використовують для масштабування real-time систем?</summary>
 
 #### NestJS
+
+Масштабування real-time систем вимагає одночасно контролювати три виміри:
+1. масштаб зʼєднань,
+2. пропускну здатність повідомлень,
+3. консистентність стану між нодами.
+
+#### Ключові підходи до масштабування
+
+1. **Горизонтальне масштабування gateway-інстансів**
+   Запускайте кілька реплік WebSocket gateway за load balancer.
+2. **Sticky sessions (коли потрібно)**
+   Забезпечуйте, щоб той самий клієнт залишався на тій самій ноді, якщо
+   транспорт/модель сесій потребує affinity.
+3. **Pub/Sub adapter для cross-node broadcast**
+   Використовуйте Redis adapter (або еквівалент), щоб події з однієї ноди
+   доходили до клієнтів на інших нодах.
+4. **Винесений спільний state**
+   Зберігайте metadata presence/rooms/session у Redis/DB, а не лише в памʼяті процесу.
+5. **Backpressure і rate limiting**
+   Обмежуйте шумних клієнтів, контролюйте fan-out bursts і захищайте downstream-системи.
+
+#### Архітектурні патерни
+
+1. **Gateway tier + worker tier**
+   Gateways обробляють зʼєднання; важку обробку виносьте в queue workers.
+2. **Partitioning каналів/кімнат**
+   Діліть high-volume потоки за tenant/region/topic.
+3. **Event-driven backbone**
+   Для durable або high-throughput розподілу подій використовуйте брокери
+   (Redis Streams/Kafka/NATS), коли простого pub/sub недостатньо.
+4. **Оптимізація fan-out**
+   Попередньо обчислюйте множини отримувачів і уникайте дорогих DB lookup на кожне повідомлення.
+
+#### Техніки продуктивності та надійності
+
+1. Використовуйте компактні payload повідомлень і уникайте надто великих подій.
+2. Застосовуйте heartbeats/ping-pong із адекватними timeout.
+3. Реалізуйте reconnect + replay стратегію для пропущених критичних повідомлень.
+4. Додавайте circuit breakers/timeout для зовнішніх залежностей.
+5. Моніторте p95/p99 latency доставки подій і drop rates.
+
+#### Обовʼязкова операційна observability
+
+1. Кількість активних зʼєднань на ноду.
+2. Повідомлення/сек вхідні та вихідні.
+3. Розподіл розмірів room і hot rooms.
+4. Lag у cross-node pub/sub.
+5. Причини error/disconnect і частка успішних reconnect.
+
+#### NestJS-специфічний стек реалізації (типово)
+
+1. `@WebSocketGateway` для real-time endpoint.
+2. Redis adapter для multi-instance propagation подій.
+3. Bull/BullMQ для винесення важких async задач.
+4. `@nestjs/throttler` або custom guards для контролю зловживань.
+
+#### Правило
+
+Масштабування real-time — це не просто «додати більше pod». Потрібно
+поєднати горизонтальні gateway, спільний pub/sub/state і суворий контроль потоку,
+щоб latency залишалася передбачуваною.
 
 </details>
 
@@ -6191,12 +6326,150 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+NestJS підтримує два підходи до інтеграції GraphQL:
+1. **Code-first**
+2. **Schema-first**
+
+Обидва підходи підходять для production. Різниця в тому, де спочатку
+визначається API contract: у TypeScript класах/декораторах чи в `.graphql`
+SDL-файлах.
+
+#### Підхід code-first
+
+Типи GraphQL і resolvers описуються в TypeScript через декоратори, а схема
+генерується автоматично.
+
+Типовий стиль:
+1. `@ObjectType()`, `@Field()`, `@InputType()`
+2. `@Resolver()`, `@Query()`, `@Mutation()`
+
+Плюси:
+1. Одна мова (TS) для застосунку і схеми.
+2. Сильна типізація та зручний refactor у IDE.
+3. Менше дублювання між DTO і моделлю схеми.
+
+Мінуси:
+1. Читабельність схеми для стейкхолдерів не з TS може бути нижчою.
+2. Згенеровану схему все одно потрібно ретельно review/version.
+
+#### Підхід schema-first
+
+Схема описується у `.graphql` файлах (SDL), а resolvers реалізуються в TS.
+
+Плюси:
+1. Contract-first workflow (добре для API governance).
+2. SDL явний і зручний для cross-team review.
+3. Добре підходить, коли схема спільна для різних мов/команд.
+
+Мінуси:
+1. Можливе дублювання між SDL і TS типами.
+2. Потрібна дисципліна синхронізації, щоб уникати drift.
+
+#### Приклади налаштування NestJS (концептуально)
+
+Code-first:
+
+```ts
+GraphQLModule.forRoot({
+  autoSchemaFile: true,
+});
+```
+
+Schema-first:
+
+```ts
+GraphQLModule.forRoot({
+  typePaths: ['./**/*.graphql'],
+});
+```
+
+#### Як обирати між ними
+
+1. Обирайте **code-first**, якщо:
+   1. Команда TypeScript-центрична.
+   2. Важлива швидкість ітерацій.
+   3. Схемою переважно володіє backend-команда.
+2. Обирайте **schema-first**, якщо:
+   1. API contract широко керується/шерується.
+   2. Кілька реалізацій/споживачів залежать від SDL.
+   3. Основний процес — contract review/versioning.
+
+#### Практична рекомендація
+
+Для більшості NestJS-команд code-first дає найшвидшу розробку і сильну
+типізацію. Schema-first варто брати там, де ключові contract governance і
+cross-team ownership SDL.
+
 </details>
 
 <details>
 <summary>84. Що таке resolvers у GraphQL і чим вони відрізняються від контролерів REST?</summary>
 
 #### NestJS
+
+Resolvers у GraphQL — це функції, які резолвлять поля в GraphQL schema.
+Це execution layer, що надає дані для queries, mutations і nested object fields.
+
+У NestJS resolvers визначаються через `@Resolver()` і декоратори методів,
+наприклад `@Query()`, `@Mutation()` і `@ResolveField()`.
+
+#### Що роблять resolvers
+
+1. Обробляють GraphQL operations (`query`, `mutation`, subscriptions за потреби).
+2. Ліниво резолвлять вкладені поля (відповідно до запитаного selection set).
+3. Використовують context (auth user, request metadata, loaders).
+4. Делегують business logic у сервіси.
+
+#### Чим resolvers відрізняються від REST контролерів
+
+1. **Форма API**
+   REST контролери відкривають багато URL endpoint.
+   GraphQL resolver зазвичай працює через один endpoint зі schema-driven operations.
+2. **Вибірка даних**
+   REST повертає фіксовану response для endpoint.
+   GraphQL динамічно повертає поля, обрані клієнтом.
+3. **Модель виконання**
+   REST контролер зазвичай формує всю response одразу.
+   GraphQL resolver tree може виконувати багато field resolvers.
+4. **Over/under-fetching**
+   У REST часто потрібні компроміси в дизайні endpoint.
+   GraphQL зменшує over/under-fetching через query selection sets.
+5. **Підхід до versioning**
+   У REST частіше явне versioning API.
+   У GraphQL схема зазвичай еволюціонує через deprecations і additive changes.
+
+#### Приклад resolver у NestJS
+
+```ts
+import { Args, Mutation, Query, Resolver } from '@nestjs/graphql';
+
+@Resolver(() => User)
+export class UsersResolver {
+  constructor(private readonly usersService: UsersService) {}
+
+  @Query(() => User, { name: 'user' })
+  findOne(@Args('id') id: string) {
+    return this.usersService.findById(id);
+  }
+
+  @Mutation(() => User)
+  createUser(@Args('input') input: CreateUserInput) {
+    return this.usersService.create(input);
+  }
+}
+```
+
+#### Best practices
+
+1. Тримайте resolvers thin; business logic виносьте в сервіси.
+2. Використовуйте DataLoader/batching, щоб уникати N+1 у nested fields.
+3. Валідуйте args/inputs і забезпечуйте authz через guards/context.
+4. Проєктуйте schema types навколо domain language, а не напряму від DB tables.
+
+#### Правило
+
+Resolvers — це GraphQL-аналог контролерів, але з field-level execution і
+семантикою client-driven data selection.
 
 </details>
 
@@ -6205,12 +6478,160 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+У NestJS GraphQL `context` — це per-request контейнер, який передає request
+metadata (user, headers, requestId, loaders, tenant info) у resolvers і guards.
+
+Авторизація зазвичай реалізується так:
+1. автентифікуємо користувача в context,
+2. застосовуємо правила доступу через GraphQL-aware guards/policies.
+
+#### Крок 1: наповнити GraphQL context
+
+Під час конфігурації `GraphQLModule` зробіть request-дані доступними в context:
+
+```ts
+GraphQLModule.forRoot({
+  autoSchemaFile: true,
+  context: ({ req, res }) => ({ req, res, requestId: req.headers['x-request-id'] }),
+});
+```
+
+Якщо JWT auth middleware/strategy додає `req.user`, це автоматично доступне
+через GraphQL context.
+
+#### Крок 2: використати context у resolver
+
+```ts
+import { Context, Query, Resolver } from '@nestjs/graphql';
+
+@Resolver()
+export class ProfileResolver {
+  @Query(() => String)
+  me(@Context() ctx: any) {
+    return ctx.req.user?.id;
+  }
+}
+```
+
+#### Крок 3: авторизувати через GraphQL guard
+
+Використайте `GqlExecutionContext`, щоб читати `req.user` у guard:
+
+```ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import { GqlExecutionContext } from '@nestjs/graphql';
+
+@Injectable()
+export class GqlAuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const gqlCtx = GqlExecutionContext.create(context);
+    const req = gqlCtx.getContext().req;
+    if (!req.user) throw new UnauthorizedException();
+    return true;
+  }
+}
+```
+
+Застосування:
+
+```ts
+@UseGuards(GqlAuthGuard)
+@Query(() => User)
+me(@Context() ctx: any) {
+  return ctx.req.user;
+}
+```
+
+#### Fine-grained авторизація
+
+1. Role-based checks через metadata + guard (`@Roles(...)`).
+2. Policy/ABAC checks через subject-action-resource service.
+3. Field-level авторизація в `@ResolveField()` за потреби.
+
+#### Best practices
+
+1. Тримайте context мінімальним, але достатнім (user, requestId, loaders, tenant).
+2. Автентифікацію робіть один раз на request, авторизацію — на операцію/поле.
+3. Використовуйте DataLoaders у context для запобігання N+1.
+4. Не довіряйте user identifiers від клієнта; використовуйте лише authenticated context.
+
+#### Правило
+
+GraphQL context — це довірений request-envelope. Кладіть туди identity, а потім
+застосовуйте авторизацію через guards/policies, побудовані на цьому context.
+
 </details>
 
 <details>
 <summary>86. Які транспортні протоколи та брокери повідомлень підтримуються (Kafka, Redis, gRPC, NATS) і в чому їх відмінності?</summary>
 
 #### NestJS
+
+NestJS мікросервіси підтримують кілька transport-рішень, зокрема Kafka, Redis,
+gRPC і NATS. Кожне має різну delivery-семантику, performance profile і use cases.
+
+#### Порівняння на високому рівні
+
+1. **Kafka**
+   Розподілений commit-log broker з високим throughput, durable retention,
+   consumer groups і можливістю replay.
+2. **Redis transport (pub/sub або streams-based patterns)**
+   Дуже швидкий, простий і низьколатентний messaging; durability/ordering
+   залежать від обраного Redis-патерну і налаштування.
+3. **gRPC**
+   RPC-протокол поверх HTTP/2 з Protobuf contracts; добре підходить для
+   сильно типізованих синхронних service-to-service викликів.
+4. **NATS**
+   Легкий високопродуктивний messaging-сервер; ефективний для low-latency
+   pub/sub і request/reply, з optional persistence через JetStream.
+
+#### Коли що обирати
+
+1. **Kafka**
+   1. Event streaming і audit trails.
+   2. Async pipelines з високим throughput.
+   3. Потрібні replay/history і масштабування consumers.
+2. **Redis**
+   1. Простий легковаговий event fan-out.
+   2. Messaging-патерни поруч із кешем.
+   3. Невеликий операційний overhead для менших систем.
+3. **gRPC**
+   1. Low-latency внутрішній RPC зі строгими контрактами.
+   2. Polyglot мікросервіси, яким потрібні generated clients/stubs.
+   3. Bidirectional streaming RPC сценарії.
+4. **NATS**
+   1. Швидкий cloud-native messaging.
+   2. Request/reply і pub/sub з мінімальним footprint.
+   3. JetStream, коли потрібні durability/ack/replay.
+
+#### Важливі семантичні відмінності
+
+1. **Стиль комунікації**
+   Kafka/NATS/Redis: асинхронні event/message-driven патерни.
+   gRPC: прямий RPC request/response (більше sync-орієнтований).
+2. **Durability/replay**
+   Kafka: сильний durable log і replay by design.
+   NATS core: ephemeral, якщо не ввімкнено JetStream.
+   Redis pub/sub: за замовчуванням ephemeral.
+   gRPC: немає broker persistence layer (RPC-семантика виклику).
+3. **Contract model**
+   gRPC використовує Protobuf-first strict schemas.
+   Broker-based transports часто покладаються на message schema conventions
+   (Avro/JSON/Protobuf), які забезпечуються командою/інструментами.
+
+#### Практичні поради для дизайну в NestJS
+
+1. Використовуйте **gRPC** для синхронних внутрішніх API зі строгою типізацією.
+2. Використовуйте **Kafka/NATS/Redis** для асинхронних декомпозованих workflow.
+3. Для критичних business events з вимогами replay/audit обирайте **Kafka** або
+   persistent патерни **NATS JetStream**.
+4. Стандартизуйте message envelopes (`eventName`, `version`, `correlationId`, `payload`).
+5. Додавайте observability для lag, retry, DLQ і health consumer-ів.
+
+#### Правило
+
+Обирайте transport насамперед за failure model і delivery guarantees, а не лише
+за сирим throughput.
 
 </details>
 
@@ -6219,12 +6640,149 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Event-driven architecture (EDA) організовує систему навколо подій: фактів, що
+щось сталося (`order.created`, `payment.failed` тощо). Producers публікують
+події, consumers реагують асинхронно.
+
+#### Ключові принципи
+
+1. **Loose coupling**
+   Producers не залежать від внутрішньої реалізації consumers.
+2. **Asynchronous communication**
+   Сервіси координуються через події, а не через blocking RPC, де це можливо.
+3. **Single source of truth per domain**
+   Кожен сервіс володіє своїми даними й публікує domain events після зміни state.
+4. **Event contract governance**
+   Події — це versioned contracts зі стабільною схемою і чіткою семантикою.
+5. **Idempotent consumers**
+   Обробники мають безпечно обробляти дублікати delivery.
+6. **Observability і traceability**
+   Correlation IDs, metadata подій і processing metrics є обовʼязковими.
+
+#### Рекомендації з дизайну подій
+
+1. Називайте події як факти в минулому часі: `invoice.paid`, `user.email_changed`.
+2. Додавайте metadata:
+   `eventId`, `eventType`, `occurredAt`, `version`, `correlationId`, `source`.
+3. Тримайте payload сфокусованим на бізнес-сенсі, а не на внутрішній DB-структурі.
+4. Віддавайте перевагу additive schema evolution; уникайте breaking changes.
+
+#### Модель доставки і консистентності
+
+1. У більшості broker-систем закладайте at-least-once delivery.
+2. Використовуйте eventual consistency між сервісами.
+3. Для failed processing застосовуйте retries + DLQ.
+4. Використовуйте outbox pattern, щоб уникнути розриву
+   «DB write succeeded, but event publish failed».
+
+#### Будівельні блоки реалізації в NestJS
+
+1. Внутрішні модульні події: `@nestjs/event-emitter` (in-process).
+2. Durable async обробка: Bull/BullMQ queues.
+3. Cross-service messaging: Kafka/NATS/Redis transport adapters.
+4. Consumer handlers із validation + idempotency checks.
+
+#### Anti-patterns, яких варто уникати
+
+1. Event payload з величезними mutable object snapshots.
+2. Прихована синхронна звʼязаність, замаскована під події.
+3. Відсутність стратегії versioning для schema.
+4. Відсутність replay/recovery плану при збоях consumers.
+5. Використання подій як команд (якщо це явно не змодельовано).
+
+#### Практичний архітектурний flow
+
+1. Command оновлює domain state у сервісі-власнику.
+2. Власник емітить domain event (транзакційно через outbox).
+3. Broker доставляє подію зацікавленим consumers.
+4. Consumers оновлюють власні read models/side effects.
+5. Monitoring відстежує lag, failures і DLQ.
+
+#### Правило
+
+Проєктуйте події як durable business facts, а не як implementation details.
+Надійність забезпечують idempotency, дисципліна контрактів і операційна
+observability.
+
 </details>
 
 <details>
 <summary>88. Як працювати з distributed transactions у мікросервісах? (Saga pattern, eventual consistency)</summary>
 
 #### NestJS
+
+У мікросервісах класична ACID-транзакція через кілька сервісів/баз зазвичай
+непрактична. Замість цього використовують **eventual consistency** і патерни
+координації, наприклад **Saga**.
+
+#### Чому distributed transactions складні
+
+1. Сервіси мають окремі бази даних.
+2. Мережеві збої та частковий успіх — нормальна ситуація.
+3. Глобальні транзакції в стилі 2PC зменшують доступність і додають складність.
+
+#### Базовий підхід: Saga pattern
+
+Saga — це послідовність локальних транзакцій між сервісами, керована
+результатами success/failure на кожному кроці.
+
+Два варіанти:
+1. **Choreography**
+   Сервіси реагують на події без центрального координатора.
+2. **Orchestration**
+   Виділений orchestrator керує порядком кроків і компенсаціями.
+
+#### Ключові концепції
+
+1. **Локальна транзакція на сервіс**
+   Кожен сервіс комітить тільки свої зміни в БД.
+2. **Compensating actions**
+   Якщо пізніший крок падає, раніше успішні кроки компенсуються
+   (`reserve -> release`, `charge -> refund`).
+3. **Idempotency**
+   Усі handlers/compensations мають витримувати duplicate delivery.
+4. **Eventual consistency**
+   Тимчасова неузгодженість допустима, доки saga не зійдеться до фінального стану.
+
+#### Приклад flow (order checkout)
+
+1. Order service створює замовлення `PENDING`.
+2. Payment service списує кошти з клієнта.
+3. Inventory service резервує залишки.
+4. Якщо все успішно -> замовлення стає `CONFIRMED`.
+5. Якщо inventory падає після payment -> виконуємо compensation
+   (`payment.refund`) і ставимо замовлення в `CANCELLED`.
+
+#### Будівельні блоки реалізації в NestJS
+
+1. Message transport/broker (Kafka, NATS, Redis тощо).
+2. Durable обробка job/event із retries і DLQ.
+3. Outbox pattern для надійного event publishing після локального commit.
+4. Відстеження saga state (DB table/workflow store).
+5. Structured logs з `correlationId`/`sagaId`.
+
+#### Tradeoff: choreography vs orchestration
+
+1. **Choreography**
+   + Простий старт, менше центральних залежностей
+   - Гірша глобальна видимість/керованість із ростом флоу
+2. **Orchestration**
+   + Чіткий ownership флоу, простіше дебажити й контролювати політики
+   - Додаткова компонента й логіка координації
+
+#### Практичні запобіжники
+
+1. Додавайте timeout для кожного кроку saga.
+2. Реалізуйте retry з backoff для transient failures.
+3. Визначайте compensation для кожного non-idempotent side effect.
+4. Тримайте кроки saga невеликими і явними.
+5. Моніторте stuck/incomplete sagas.
+
+#### Правило
+
+У мікросервісах не намагайтеся отримати глобальний ACID. Моделюйте бізнес-флоу
+як sagas: з idempotent handlers, compensation-механізмами і сильною
+observability.
 
 </details>
 
@@ -6233,12 +6791,192 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+CQRS (Command Query Responsibility Segregation) розділяє операції запису
+(commands) та операції читання (queries), часто з різними моделями й
+стратегіями оптимізації для кожної сторони.
+
+#### Навіщо використовують CQRS
+
+1. Чітке розділення business mutations і read concerns.
+2. Краща масштабованість для read-heavy систем.
+3. Простіше моделювати складні domain workflows.
+4. Чистіша інтеграція з подіями та eventual consistency.
+
+#### Базові компоненти CQRS
+
+1. **Command**
+   Намір змінити стан (`CreateOrderCommand`).
+2. **CommandHandler**
+   Виконує бізнес-логіку і записує стан.
+3. **Query**
+   Запит даних без side effects (`GetOrderByIdQuery`).
+4. **QueryHandler**
+   Повертає read model/data projection.
+5. **Events** (опціонально, але часто)
+   Факти, що емітяться після успішних змін стану.
+
+#### Реалізація в NestJS через `@nestjs/cqrs`
+
+Крок 1: встановити і підключити `CqrsModule`.
+
+```ts
+@Module({
+  imports: [CqrsModule],
+  providers: [CreateOrderHandler, GetOrderByIdHandler],
+})
+export class OrdersModule {}
+```
+
+Крок 2: визначити command + handler.
+
+```ts
+export class CreateOrderCommand {
+  constructor(
+    public readonly userId: string,
+    public readonly items: Array<{ sku: string; qty: number }>,
+  ) {}
+}
+
+@CommandHandler(CreateOrderCommand)
+export class CreateOrderHandler implements ICommandHandler<CreateOrderCommand> {
+  constructor(private readonly ordersService: OrdersService) {}
+
+  async execute(command: CreateOrderCommand) {
+    return this.ordersService.create(command.userId, command.items);
+  }
+}
+```
+
+Крок 3: визначити query + handler.
+
+```ts
+export class GetOrderByIdQuery {
+  constructor(public readonly orderId: string) {}
+}
+
+@QueryHandler(GetOrderByIdQuery)
+export class GetOrderByIdHandler implements IQueryHandler<GetOrderByIdQuery> {
+  constructor(private readonly readRepo: OrdersReadRepository) {}
+
+  async execute(query: GetOrderByIdQuery) {
+    return this.readRepo.findById(query.orderId);
+  }
+}
+```
+
+Крок 4: використовувати buses у controller/service.
+
+```ts
+constructor(
+  private readonly commandBus: CommandBus,
+  private readonly queryBus: QueryBus,
+) {}
+
+await this.commandBus.execute(new CreateOrderCommand(userId, items));
+return this.queryBus.execute(new GetOrderByIdQuery(orderId));
+```
+
+#### Коли CQRS виправданий
+
+1. Складні domain rules і workflows.
+2. Різні вимоги до масштабування reads та writes.
+3. Потреба в event-driven projections/read models.
+
+#### Коли не варто overuse CQRS
+
+1. Невеликі CRUD-застосунки з простою логікою.
+2. Команди, які ще не готові до додаткової архітектурної складності.
+
+#### Правило
+
+Використовуйте CQRS там, де це виправдано бізнес-складністю або вимогами
+масштабування. В інших випадках тримайте простішу service/repository модель і
+розвивайте її поступово.
+
 </details>
 
 <details>
 <summary>90. Що таке Domain-Driven Design і як його принципи застосовуються в NestJS?</summary>
 
 #### NestJS
+
+Domain-Driven Design (DDD) — це підхід, у якому програму моделюють навколо
+ключових бізнес-доменів і їхньої мови, а не лише навколо технічних шарів.
+
+У NestJS DDD застосовується через узгодження модулів і меж коду з
+бізнес-можливостями та доменними правилами.
+
+#### Основні принципи DDD
+
+1. **Ubiquitous language**
+   Спільний бізнес-словник у коді, документації та комунікації.
+2. **Bounded contexts**
+   Чіткі межі, в яких модель має конкретне значення.
+3. **Entities / Value Objects / Aggregates**
+   Доменні обʼєкти з явними інваріантами та правилами консистентності.
+4. **Domain services**
+   Stateless бізнес-операції, що не належать одній конкретній сутності.
+5. **Repositories**
+   Абстракції для завантаження/збереження агрегатів.
+6. **Domain events**
+   Бізнес-факти, які емітяться при важливих змінах стану.
+
+#### Як це мапиться на NestJS
+
+1. **Feature modules як bounded contexts**
+   `OrdersModule`, `BillingModule`, `InventoryModule`.
+2. **Application layer services**
+   Оркеструють use cases, транзакції, інтеграції.
+3. **Domain layer**
+   Чиста бізнес-модель (entities/value objects/policies), framework-agnostic.
+4. **Infrastructure adapters**
+   DB, messaging, зовнішні API, HTTP controllers.
+
+#### Типова структура папок (приклад)
+
+```text
+orders/
+  application/
+    commands/
+    queries/
+    orders.application-service.ts
+  domain/
+    entities/
+    value-objects/
+    events/
+    repositories/
+  infrastructure/
+    persistence/
+    messaging/
+    http/
+  orders.module.ts
+```
+
+#### Практичні переваги DDD у NestJS
+
+1. Краще підходить для складної бізнес-логіки.
+2. Зменшує випадкову звʼязаність між доменами.
+3. Робить core-логіку більш тестованою незалежно від framework/infrastructure.
+4. Полегшує еволюцію архітектури в міру росту системи.
+
+#### Типові помилки
+
+1. Називати будь-який layered code «DDD» без глибокої доменної моделі.
+2. Протікання ORM entities напряму в доменну логіку.
+3. Непослідовне змішування технічної мови з бізнес-поняттями.
+4. Overengineering DDD для тривіальних CRUD-сервісів.
+
+#### Коли DDD найбільш корисний
+
+1. Багаті й мінливі бізнес-правила.
+2. Кілька команд/доменів в одній платформі.
+3. Потреба у довгостроковій ясності моделі та автономії bounded contexts.
+
+#### Правило
+
+Впроваджуйте DDD поступово: починайте з чітких bounded contexts і ubiquitous
+language, а далі поглиблюйте тактичні патерни там, де це виправдано
+складністю домену.
 
 </details>
 
@@ -6247,12 +6985,178 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Hexagonal Architecture (Ports & Adapters) організовує застосунок так, щоб
+бізнес-логіка була ізольована від зовнішніх технологій (DB, HTTP, message
+brokers, SDKs).
+
+Core залежить від абстракцій (ports), а конкретні інтеграції реалізуються як
+adapters.
+
+#### Ключові концепції
+
+1. **Domain/Application Core**
+   Бізнес-правила і оркестрація use cases.
+2. **Ports**
+   Інтерфейси/контракти, які core використовує (output ports) або експонує
+   (input ports).
+3. **Adapters**
+   Технічні реалізації портів:
+   HTTP controllers, DB repositories, message consumers, external API clients.
+
+#### Правило залежностей
+
+Усі залежності мають бути направлені всередину:
+1. Adapters залежать від core contracts.
+2. Core не залежить від details framework/infrastructure.
+
+#### Як застосувати в NestJS
+
+1. Визначити port interfaces у domain/application layer.
+2. Реалізувати adapters в infrastructure layer.
+3. Привʼязати adapter-класи до port tokens у providers модуля.
+4. Використовувати DI, щоб інжектити port у use-case сервіси.
+
+#### Приклад структури
+
+Port (core contract):
+
+```ts
+export interface PaymentPort {
+  charge(input: { orderId: string; amount: number }): Promise<{ paymentId: string }>;
+}
+```
+
+Application service:
+
+```ts
+@Injectable()
+export class CheckoutService {
+  constructor(@Inject('PAYMENT_PORT') private readonly payments: PaymentPort) {}
+
+  async checkout(orderId: string, amount: number) {
+    return this.payments.charge({ orderId, amount });
+  }
+}
+```
+
+Реалізація adapter:
+
+```ts
+@Injectable()
+export class StripePaymentAdapter implements PaymentPort {
+  async charge(input: { orderId: string; amount: number }) {
+    // виклик Stripe SDK
+    return { paymentId: 'pay_123' };
+  }
+}
+```
+
+Provider binding:
+
+```ts
+{
+  provide: 'PAYMENT_PORT',
+  useClass: StripePaymentAdapter,
+}
+```
+
+#### Переваги
+
+1. Простіше тестувати (можна мокати ports в unit-тестах).
+2. Менша звʼязаність із framework/ORM/зовнішніми вендорами.
+3. Безпечніші довгострокові refactor-и і заміни технологій.
+4. Чіткіші архітектурні межі для команд.
+
+#### Типові помилки
+
+1. Занадто generic ports (втрачається domain-значення).
+2. Протікання ORM/HTTP типів у core interfaces.
+3. Надмірна абстракція для дуже маленьких/простих модулів.
+
+#### Правило
+
+Використовуйте hexagonal boundaries навколо важливих business flows та
+нестабільних зовнішніх залежностей. Тримайте ports business-oriented, а adapters
+— взаємозамінними.
+
 </details>
 
 <details>
 <summary>92. Як реалізувати структуроване логування, і навіщо це потрібно?</summary>
 
 #### NestJS
+
+Структуроване логування означає запис логів у machine-readable форматі (зазвичай
+JSON) з консистентними полями, а не як довільні текстові рядки.
+
+Це потрібно для пошуку, алертингу, кореляції й надійної observability у
+production-системах.
+
+#### Чому structured logging важливий
+
+1. Швидка фільтрація/запити в log-платформах.
+2. Краще дебаження інцидентів через correlation IDs.
+3. Консистентні дашборди й алерти.
+4. Простіший cross-service tracing у distributed systems.
+
+#### Що має бути в кожному логу
+
+1. `timestamp`
+2. `level` (`debug`, `info`, `warn`, `error`)
+3. `service` / `env`
+4. `message`
+5. `requestId` / `traceId`
+6. Context-поля (`userId`, `route`, `method`, `statusCode`, latency)
+7. Error details (`errorName`, `stack`) для збоїв
+
+#### Підхід реалізації в NestJS
+
+1. Використовуйте structured logger (Pino/Winston) як app logger.
+2. Додавайте request context (`requestId`, user info) через middleware/interceptor.
+3. Логуйте business events і failures у консистентній схемі.
+4. Уникайте ad-hoc `console.log` у production-коді.
+
+#### Практичний стиль прикладу
+
+```json
+{
+  "level": "info",
+  "message": "order.created",
+  "service": "orders-api",
+  "requestId": "5e8f...",
+  "orderId": "ord_123",
+  "userId": "usr_77",
+  "durationMs": 42
+}
+```
+
+#### Рекомендації для error-логування
+
+1. Зберігайте повний stack trace у логах.
+2. Не повертайте stack traces у API-відповідях.
+3. Додавайте domain error codes для надійного маршрутування алертів.
+4. Зберігайте root cause chain при wrapping exceptions.
+
+#### Типові помилки
+
+1. Логування plain strings без context-полів.
+2. Неконсистентні назви полів між модулями/сервісами.
+3. Логування secrets/tokens/PII без редагування.
+4. Надмірний debug-шум у hot paths продакшену.
+
+#### Best practices
+
+1. Визначте й задокументуйте log schema.
+2. Централізовано редагуйте чутливі поля.
+3. Свідомо використовуйте log levels.
+4. Корелюйте логи з метриками й трасами.
+5. Перевіряйте logging output в integration-тестах для критичних флоу.
+
+#### Правило
+
+Якщо логи лише для людей, incident response буде повільним. Якщо логи
+структуровані для машин і людей, операційна робота стає передбачуваною й
+масштабованою.
 
 </details>
 
@@ -6261,12 +7165,171 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Моніторинг health стану застосунку в NestJS зазвичай реалізують через
+`@nestjs/terminus`, який надає стандартизовані health-check endpoint для app і
+залежностей (readiness/liveness).
+
+#### Навіщо потрібен health monitoring
+
+1. Оркестраторам/load balancer потрібні health-сигнали.
+2. Швидше виявлення інцидентів і автоматичне відновлення.
+3. Безпечні deployment rollout і readiness gating.
+
+#### Типові health endpoint
+
+1. **Liveness** (`/health/live`)
+   Перевірка «процес працює».
+2. **Readiness** (`/health/ready`)
+   Перевірка «інстанс може обслуговувати трафік зараз», включно з критичними залежностями.
+
+#### Базові кроки налаштування
+
+1. Встановіть `@nestjs/terminus`.
+2. Імпортуйте `TerminusModule`.
+3. Створіть `HealthController` з використанням `HealthCheckService`.
+
+#### Приклад контролера
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import {
+  HealthCheck,
+  HealthCheckService,
+  HttpHealthIndicator,
+  MemoryHealthIndicator,
+} from '@nestjs/terminus';
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly http: HttpHealthIndicator,
+    private readonly memory: MemoryHealthIndicator,
+  ) {}
+
+  @Get('live')
+  @HealthCheck()
+  live() {
+    return this.health.check([
+      () => this.memory.checkHeap('memory_heap', 300 * 1024 * 1024),
+    ]);
+  }
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.http.pingCheck('docs', 'https://example.com/health'),
+    ]);
+  }
+}
+```
+
+#### Що додавати в readiness
+
+1. DB connectivity.
+2. Redis/cache connectivity.
+3. Критичні зовнішні залежності (лише якщо справді потрібні для обслуговування трафіку).
+4. Внутрішні resource thresholds (memory, event-loop pressure за потреби).
+
+#### Операційні best practices
+
+1. Тримайте liveness легким і локальним.
+2. Тримайте readiness залежним від критичних сервісів, але швидким.
+3. Не включайте некритичні опційні сервіси в fail-критерії readiness.
+4. Обмежуйте/захищайте health-деталі в публічних середовищах.
+5. Інтегруйте з Kubernetes probes та alerting.
+
+#### Правило
+
+Liveness каже: «перезапусти мене, якщо я мертвий». Readiness каже:
+«маршрутизуй трафік на мене лише тоді, коли я реально можу безпечно обробляти
+запити».
+
 </details>
 
 <details>
 <summary>94. Як реалізувати health checks для залежних сервісів (DB, Redis, зовнішні API)?</summary>
 
 #### NestJS
+
+Health checks для залежностей перевіряють, чи критичні зовнішні системи
+достатньо доступні, щоб застосунок міг безпечно обслуговувати трафік.
+
+У NestJS це зазвичай реалізується через indicators з `@nestjs/terminus`.
+
+#### Категорії залежностей для перевірки
+
+1. **Database** (readiness-критична для більшості API).
+2. **Redis/cache** (критична або опційна залежно від архітектури).
+3. **External APIs** (лише ті, що потрібні для core request paths).
+
+#### Підхід до реалізації
+
+1. Тримайте `/health/live` легким (перевірка рівня процесу).
+2. Dependency checks розміщуйте в `/health/ready`.
+3. Некритичні залежності позначайте окремо, щоб уникати зайвих hard-fail.
+
+#### Приклад readiness controller
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import {
+  HealthCheck,
+  HealthCheckService,
+  HttpHealthIndicator,
+  MongooseHealthIndicator,
+  TypeOrmHealthIndicator,
+} from '@nestjs/terminus';
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly db: TypeOrmHealthIndicator,
+    private readonly http: HttpHealthIndicator,
+    private readonly mongo: MongooseHealthIndicator,
+  ) {}
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.db.pingCheck('postgres'),
+      () => this.http.pingCheck('payments-api', 'https://payments.example.com/health'),
+      () => this.mongo.pingCheck('mongo-analytics'),
+    ]);
+  }
+}
+```
+
+Для Redis використовуйте custom health indicator або підтримуваний adapter
+indicator, залежно від вашого стеку.
+
+#### Важливі дизайн-рішення
+
+1. **Critical vs optional dependency**
+   Лише критичні залежності мають валити readiness.
+2. **Timeouts**
+   Health checks повинні мати короткі жорсткі timeout, щоб уникати накопичення probes.
+3. **Check cost**
+   Використовуйте легкі "ping" checks, а не дорогі запити.
+4. **Failure semantics**
+   Повертайте зрозумілий статус по кожній залежності для діагностики.
+
+#### Операційні best practices
+
+1. Використовуйте окремі endpoint для liveness/readiness/startup probes.
+2. Уникайте перевірки занадто великої кількості нестабільних external services у readiness.
+3. Додавайте caching/debouncing для дорогих checks, якщо потрібно.
+4. Алертіть на transitions статусів залежностей, а не лише на повний app down.
+5. Виносьте latency залежностей в observability dashboards.
+
+#### Правило
+
+Health checks повинні відповідати на питання: "Чи може цей інстанс коректно
+обслуговувати запити прямо зараз?" Проєктуйте dependency checks саме навколо
+цього питання, а не навколо спроби перевірити все підряд.
 
 </details>
 
@@ -6275,12 +7338,146 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+OpenTelemetry (OTel) у NestJS використовується для збору traces, metrics і logs
+для observability. Найчастіший старт — distributed tracing для вхідних запитів
+і downstream-викликів.
+
+#### Що дає OpenTelemetry
+
+1. End-to-end трасування запитів між сервісами.
+2. Розбиття latency по spans (DB, HTTP, cache, queue).
+3. Кореляцію між помилками та конкретними залежностями.
+4. Vendor-neutral формат телеметрії (експорт у Jaeger/Tempo/Datadog/New Relic тощо).
+
+#### Типовий flow налаштування OTel у NestJS
+
+1. Ініціалізувати OTel SDK до bootstrap застосунку.
+2. Налаштувати resource attributes (`service.name`, `service.version`, env).
+3. Увімкнути auto-instrumentations (HTTP, Express, DB clients тощо).
+4. Експортувати traces через OTLP/collector.
+5. Додати custom spans там, де важливий бізнес-контекст.
+
+#### Мінімальний концептуальний bootstrap (Node SDK)
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { Resource } from '@opentelemetry/resources';
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    'service.name': 'nestjs-api',
+    'service.version': '1.0.0',
+    'deployment.environment': process.env.NODE_ENV ?? 'development',
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+Після цього запускайте Nest app як звичайно.
+
+#### Приклад custom span (business boundary)
+
+1. Створіть span навколо критичної доменної операції.
+2. Додайте attributes (`order.id`, `tenant.id`).
+3. Записуйте exceptions і статус у разі збою.
+
+#### Практичні best practices
+
+1. Розумно налаштовуйте sampling (повний у staging, tuned у production).
+2. Пропагуйте context headers (`traceparent`) через HTTP/message boundaries.
+3. Уникайте high-cardinality attributes (email користувача, випадкові ID в labels).
+4. Інструментуйте критичні залежності та queue consumers.
+5. Корелюйте traces з logs через trace/span IDs.
+
+#### Типові помилки
+
+1. Ініціалізація OTel після старту app (втрачаються ранні spans).
+2. Over-instrumentation, що дає зайвий overhead/noise.
+3. Відсутня context propagation між сервісами/воркерами.
+4. Відправка телеметрії напряму з app без collector у великих деплойментах.
+
+#### Правило
+
+Починайте з tracing + auto-instrumentation, а далі додавайте цільові custom
+spans навколо high-value бізнес-операцій і latency hotspots.
+
 </details>
 
 <details>
 <summary>96. Що таке distributed tracing і як його реалізують у мікросервісній архітектурі?</summary>
 
 #### NestJS
+
+Distributed tracing відстежує один request/transaction через кілька сервісів та
+інфраструктурних компонентів, показуючи end-to-end flow і розкладку latency.
+
+Це критично для мікросервісів, де одна дія користувача може запускати багато
+service calls, queue hops і DB operations.
+
+#### Базові поняття tracing
+
+1. **Trace**
+   Повний end-to-end шлях запиту.
+2. **Span**
+   Одна операція всередині trace (HTTP call, DB query, виконання handler).
+3. **Context propagation**
+   Передача trace context між сервісами (наприклад, заголовок `traceparent`).
+4. **Parent-child relationships**
+   Spans формують дерево, яке відображає ієрархію викликів.
+
+#### Навіщо потрібен distributed tracing
+
+1. Знаходити реальні bottleneck (яка залежність повільна).
+2. Швидко дебажити cross-service failures.
+3. Розуміти fan-out/fan-in поведінку і retry storms.
+4. Покращувати p95/p99 на основі фактів, а не здогадок.
+
+#### Як це реалізується в мікросервісах
+
+1. Інструментувати кожен сервіс через OpenTelemetry SDK.
+2. Увімкнути auto-instrumentation для framework/library (HTTP server/client, DB, message clients).
+3. Пропагувати context через межі:
+   1. HTTP headers (`traceparent`, `tracestate`)
+   2. Message metadata для Kafka/NATS/queues
+4. Експортувати spans у collector/backend (OTLP -> Jaeger/Tempo/Datadog тощо).
+5. Корелювати логи з traceId/spanId.
+
+#### NestJS-специфічні точки реалізації
+
+1. Ініціалізувати OTel до bootstrap Nest.
+2. Інструментувати вхідні запити (Express/Fastify).
+3. Інструментувати вихідні `HttpService` виклики і DB drivers.
+4. Додавати custom spans навколо важливих бізнес-операцій.
+5. Пропагувати context у workers/background jobs.
+
+#### Типовий trace на практиці
+
+1. API Gateway отримує запит (root span).
+2. Service A валідовує auth (child span).
+3. Service A викликає Service B через gRPC/HTTP (child span).
+4. Service B робить запит у DB (nested span).
+5. Service B публікує подію в broker (child span).
+6. Worker споживає подію і виконує side effect (linked/continued context).
+
+#### Best practices
+
+1. Використовуйте консистентні назви сервісів і resource attributes.
+2. Уникайте high-cardinality span attributes.
+3. Налаштовуйте sampling policy (tail-based/head-based за профілем трафіку).
+4. Фіксуйте помилки й статус-коди на spans.
+5. Узгоджуйте trace retention з потребами incident/debug.
+
+#### Правило
+
+У мікросервісах metrics показують, що щось повільне; distributed tracing показує
+точно де і чому.
 
 </details>
 
@@ -6289,12 +7486,177 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Unit testing у NestJS фокусується на перевірці поведінки одного класу/модуля в
+ізоляції, зазвичай із моками залежностей і без реальних network/database calls.
+
+#### Основні рівні тестування в NestJS
+
+1. **Unit tests**
+   Тестують services/guards/pipes/interceptors ізольовано.
+2. **Integration tests**
+   Тестують взаємодію між компонентами/модулями (часто з test DB).
+3. **E2E tests**
+   Тестують повну HTTP-поведінку app через реальний bootstrap Nest застосунку.
+
+#### Типовий стек для unit-тестів
+
+1. Jest як test runner/assertion/mocking tool.
+2. `@nestjs/testing` для створення testing modules.
+3. Mock providers для залежностей (`useValue`, `useFactory`).
+
+#### Приклад unit-тесту для service
+
+```ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { NotFoundException } from '@nestjs/common';
+
+describe('UsersService', () => {
+  let service: UsersService;
+  const repoMock = {
+    findById: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: 'USERS_REPOSITORY', useValue: repoMock },
+      ],
+    }).compile();
+
+    service = module.get(UsersService);
+    jest.clearAllMocks();
+  });
+
+  it('returns user when found', async () => {
+    repoMock.findById.mockResolvedValue({ id: 'u1', email: 'a@example.com' });
+    await expect(service.getById('u1')).resolves.toEqual({
+      id: 'u1',
+      email: 'a@example.com',
+    });
+  });
+
+  it('throws NotFoundException when user is missing', async () => {
+    repoMock.findById.mockResolvedValue(null);
+    await expect(service.getById('missing')).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+#### Базові підходи до тестування
+
+1. **Arrange-Act-Assert**
+   Тримайте тести читабельними та детермінованими.
+2. **Mock external boundaries**
+   DB, HTTP-клієнти, queues та системи, залежні від часу.
+3. **Тестуйте поведінку, а не implementation details**
+   Перевіряйте результати та side effects, а не приватні внутрішні деталі.
+4. **Покривайте happy path + failure path**
+   Validation errors, exceptions, edge cases.
+
+#### Що unit-тестувати в NestJS у першу чергу
+
+1. Application/domain services.
+2. Custom guards/pipes/interceptors.
+3. Utility/domain logic класи.
+4. Mapper/validation логіку з розгалуженою поведінкою.
+
+#### Типові помилки
+
+1. Виклики реальної БД у "unit" тестах.
+2. Надмірний mocking, коли тести втрачають цінність.
+3. Занадто жорсткі assert на крихкі внутрішні виклики.
+4. Ігнорування негативних/error сценаріїв.
+
+#### Правило
+
+Unit-тести мають бути швидкими, ізольованими і детермінованими. Використовуйте
+їх для фіксації поведінки бізнес-логіки; integration/e2e тести залишайте для
+перевірки wiring і реальної runtime-поведінки.
+
 </details>
 
 <details>
 <summary>98. Як правильно мокати залежності в NestJS, і коли це потрібно робити?</summary>
 
 #### NestJS
+
+Мокання залежностей у NestJS означає заміну реальних колабораторів (DB repos,
+HTTP clients, queues, external SDKs) контрольованими test doubles, щоб
+ізолювати поведінку unit-рівня.
+
+#### Коли потрібно мокати
+
+1. У unit-тестах для services/guards/pipes/interceptors.
+2. Для тестування failure-path, який важко відтворити на реальних системах.
+3. Для швидкого feedback loop, де зовнішній I/O уповільнює тести.
+
+#### Коли не потрібно мокати
+
+1. В integration-тестах, що перевіряють module wiring і реальні adapters.
+2. В E2E-тестах, що перевіряють повну runtime-поведінку.
+3. Коли високий ризик contract drift і важлива взаємодія з реальною залежністю.
+
+#### Типовий патерн мокання в NestJS
+
+Використовуйте `TestingModule` і перевизначайте provider tokens через
+`useValue`/`useFactory`.
+
+```ts
+import { Test } from '@nestjs/testing';
+
+describe('UsersService', () => {
+  let service: UsersService;
+  const usersRepoMock = {
+    findById: jest.fn(),
+    save: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: 'USERS_REPOSITORY', useValue: usersRepoMock },
+      ],
+    }).compile();
+
+    service = moduleRef.get(UsersService);
+    jest.clearAllMocks();
+  });
+});
+```
+
+#### Поради з мокання за типом залежності
+
+1. **Repository/DAO**
+   Мокайте конкретні методи, що використовуються в тесті (`findOne`, `save` тощо).
+2. **HttpService / external client**
+   Мокайте return values/errors і timeout-сценарії.
+3. **Queue/event publishers**
+   Мокайте enqueue/publish виклики і перевіряйте payload/contracts.
+4. **ConfigService**
+   Мокайте явні ключі, що використовуються у code path.
+
+#### Хороші практики мокання
+
+1. Мокайте тільки boundary dependencies, а не сам class under test.
+2. Тримайте моки мінімальними й сфокусованими на поведінці.
+3. Скидайте моки між тестами.
+4. Спочатку перевіряйте outcomes, потім interactions.
+5. Явно включайте negative paths (throws/rejects).
+
+#### Типові помилки
+
+1. Over-mocking внутрішніх методів того самого класу (тестуються implementation details).
+2. Повторне використання stateful mocks між тест-кейсами без reset.
+3. Mock values, що порушують форму реального контракту (false confidence).
+4. Написання лише happy-path тестів.
+
+#### Правило
+
+Мокайте, щоб ізолювати бізнес-логіку й пришвидшити unit-тести.
+Integration/e2e тести використовуйте для перевірки реального wiring і зовнішніх
+контрактів.
 
 </details>
 
@@ -6303,12 +7665,178 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Integration tests у NestJS перевіряють, що кілька реальних компонентів
+працюють разом (module wiring, DI, repositories/services, pipes/guards), але
+залишаються легшими за повні E2E-тести.
+
+`TestingModule` — основний інструмент для складання тестового контексту
+застосунку.
+
+#### Мета integration-тестів
+
+1. Валідовувати взаємодію між реальними providers.
+2. Ловити проблеми DI/config/module wiring.
+3. Тестувати persistence/service flows з реалістичними залежностями.
+
+#### Типовий setup flow
+
+1. Створити `TestingModule` з реальним(и) модулем(ями) під тестом.
+2. Опційно перевизначити лише зовнішні boundaries (наприклад, third-party API).
+3. Ініціалізувати app/module context.
+4. Підготувати test data.
+5. Виконати сценарій і перевірити side effects/results.
+
+#### Приклад з `TestingModule` + repository/service
+
+```ts
+import { Test, TestingModule } from '@nestjs/testing';
+
+describe('UsersModule Integration', () => {
+  let moduleRef: TestingModule;
+  let service: UsersService;
+
+  beforeAll(async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [UsersModule, TestDatabaseModule], // реальне module wiring
+    }).compile();
+
+    service = moduleRef.get(UsersService);
+  });
+
+  afterAll(async () => {
+    await moduleRef.close();
+  });
+
+  it('creates and loads user through real repository path', async () => {
+    const created = await service.create({
+      email: 'integration@example.com',
+      password: 'secret123',
+    });
+
+    const loaded = await service.getById(created.id);
+    expect(loaded.email).toBe('integration@example.com');
+  });
+});
+```
+
+#### Які залежності використовувати
+
+1. Віддавайте перевагу реальній БД в ізольованому test environment
+   (test container/in-memory DB, де це прийнятно).
+2. Мокайте лише нестабільні/дорогі зовнішні системи
+   (payment gateways, SaaS APIs).
+3. Тримайте конфігурацію близькою до production semantics.
+
+#### Стратегії керування даними
+
+1. Transaction rollback на тест (де можливо).
+2. Truncate/reset таблиць між тестами.
+3. Deterministic test fixtures/builders.
+
+#### Типові помилки
+
+1. Перетворення integration-тестів на unit-тести через мокання всього.
+2. Спільний mutable global state між тестами.
+3. Випадкова залежність від production/staging DB.
+4. Відсутність cleanup, що дає flaky order-dependent тести.
+
+#### Практичне правило
+
+Integration-тести мають валідовувати реальну співпрацю модулів із мінімальним
+mocking. Це головна страховка від поламаного wiring і регресій у persistence.
+
 </details>
 
 <details>
 <summary>100. Що таке end-to-end (E2E) тестування в NestJS, і чим воно відрізняється від unit та integration тестів?</summary>
 
 #### NestJS
+
+E2E (end-to-end) тестування в NestJS перевіряє повну поведінку застосунку через
+реальні публічні інтерфейси (зазвичай HTTP), максимально наближено до того, як
+системою користуються реальні клієнти.
+
+Це рівень тестування з найвищою довірою для API contracts, middleware/guards,
+validation, error mapping і infrastructure wiring.
+
+#### Чим E2E відрізняється від інших рівнів тестування
+
+1. **Unit tests**
+   Тестують один клас ізольовано з моками залежностей.
+2. **Integration tests**
+   Тестують співпрацю кількох реальних компонентів/модулів.
+3. **E2E tests**
+   Тестують повний ланцюжок request -> framework pipeline -> business logic ->
+   persistence -> response.
+
+#### Типовий E2E setup у NestJS
+
+1. Створити testing module з повним `AppModule` (або майже повним).
+2. Підняти інстанс Nest application.
+3. Надсилати реальні HTTP requests (часто через `supertest`).
+4. Перевіряти статус-коди, response body і side effects.
+
+#### Мінімальний E2E приклад
+
+```ts
+import { Test } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import request from 'supertest';
+
+describe('Users E2E', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('POST /users creates a user', async () => {
+    await request(app.getHttpServer())
+      .post('/users')
+      .send({ email: 'e2e@example.com', password: 'secret123' })
+      .expect(201)
+      .expect(res => {
+        expect(res.body.email).toBe('e2e@example.com');
+      });
+  });
+});
+```
+
+#### Що E2E ловить найкраще
+
+1. Зламаний route/guard/pipe/interceptor setup.
+2. Проблеми валідації та серіалізації.
+3. Regression в auth flow.
+4. Drift реального API contract.
+5. Проблеми глобального error handling і response shape.
+
+#### Типові помилки
+
+1. Покладатися лише на E2E (надто повільно для повного покриття логіки).
+2. Запускати тести на спільних неізольованих середовищах.
+3. Нестабільний setup/cleanup тест-даних, що дає flaky тести.
+4. Надто широка E2E-сюїта, яка стає повільною і важкою в підтримці.
+
+#### Практична testing pyramid
+
+1. Багато unit-тестів (швидка впевненість у логіці).
+2. Деяка кількість integration-тестів (впевненість у wiring).
+3. Менше, але цінних E2E-тестів (впевненість у контрактах).
+
+#### Правило
+
+Використовуйте E2E-тести для захисту критичних user/business journey та
+зовнішніх API contracts; нижчі рівні тестів використовуйте для глибини й
+швидкості.
 
 </details>
 
@@ -6317,11 +7845,159 @@ presence). Контракти протоколу робіть явними й з
 
 #### NestJS
 
+Nest CLI — це офіційний command-line інструмент для створення, генерації,
+запуску та підтримки NestJS-застосунків.
+
+Він стандартизує scaffolding проєкту і пришвидшує щоденну розробку.
+
+#### Для чого використовується Nest CLI
+
+1. Створювати нові проєкти з рекомендованою структурою.
+2. Швидко генерувати modules/controllers/services/resources.
+3. Запускати app у dev/watch mode.
+4. Збирати production bundles.
+5. Запускати тести через налаштовані scripts/tooling.
+
+#### Найуживаніші команди
+
+1. **Створити застосунок**
+   `nest new my-app`
+2. **Запуск у development**
+   `npm run start:dev`
+   (або `nest start --watch`, залежно від setup)
+3. **Зібрати застосунок**
+   `npm run build`
+   (або `nest build`)
+4. **Згенерувати модуль**
+   `nest g module users`
+5. **Згенерувати контролер**
+   `nest g controller users`
+6. **Згенерувати сервіс**
+   `nest g service users`
+7. **Згенерувати повний CRUD resource**
+   `nest g resource users`
+8. **Запустити тести**
+   `npm test`, `npm run test:watch`, `npm run test:e2e`
+
+#### Корисні aliases
+
+1. `nest generate` -> `nest g`
+2. `nest controller` -> `nest g co`
+3. `nest service` -> `nest g s`
+4. `nest module` -> `nest g mo`
+
+#### Приклад практичного workflow
+
+1. `nest g resource orders`
+2. Реалізувати domain/use-case логіку.
+3. `npm run start:dev` для локальної ітерації.
+4. `npm run test` і `npm run test:e2e`.
+5. `npm run build` перед релізом.
+
+#### Best practices
+
+1. Використовуйте CLI generators, щоб структура була консистентною в команді.
+2. Переглядайте згенерований код і прибирайте зайвий boilerplate.
+3. Віддавайте перевагу явним архітектурним межам, а не сліпо згенерованому layering.
+4. Тримайте scripts у `package.json` узгодженими з CI workflow команди.
+
+#### Правило
+
+Nest CLI — це інструмент продуктивності, а не архітектура. Використовуйте його
+для швидкого scaffolding, а далі формуйте кодову базу під домен і стандарти
+якості.
+
 </details>
 
 <details>
 <summary>102. Як правильно організувати Dockerfile для NestJS застосунку (multi-stage build)?</summary>
 
 #### NestJS
+
+Правильний multi-stage Dockerfile для NestJS відділяє build-time залежності від
+runtime image, що дає менші, безпечніші й швидші production-контейнери.
+
+#### Чому multi-stage build важливий
+
+1. Менший фінальний розмір image.
+2. Менша attack surface (без dev/build tooling у runtime).
+3. Швидші deploy/pull.
+4. Чистіші межі залежностей.
+
+#### Рекомендована multi-stage структура
+
+1. **deps stage**
+   Встановлення залежностей через lockfile.
+2. **build stage**
+   Компіляція TypeScript -> `dist`.
+3. **runtime stage**
+   Копіювання лише скомпільованого output + production dependencies.
+
+#### Приклад Dockerfile
+
+```dockerfile
+# -------- deps --------
+FROM node:20-alpine AS deps
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+# -------- build --------
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# -------- runtime --------
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /app/dist ./dist
+
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+#### Рекомендований `.dockerignore`
+
+1. `node_modules`
+2. `dist`
+3. `.git`
+4. `coverage`
+5. локальні env-файли, які не потрібні в build context
+
+#### Security і runtime best practices
+
+1. За можливості запускайте під non-root user.
+2. Фіксуйте major-версію Node і оновлюйте base images.
+3. Інжектіть конфіг через environment/secret manager, а не запікайте у файли.
+4. Додавайте health checks і graceful shutdown support.
+5. Скануйте image на вразливості в CI.
+
+#### Поради для build performance
+
+1. Копіюйте lockfile рано, щоб використовувати layer caching.
+2. Уникайте інвалідації dependency layer через часті source-only зміни.
+3. Використовуйте детерміновані інсталяції (`npm ci`).
+
+#### Типові помилки
+
+1. Single-stage image з повними dev dependencies.
+2. Постачання source і build tools у runtime image.
+3. Копіювання всього контексту до встановлення залежностей (ламає ефективність кешу).
+4. Зберігання secrets у Dockerfile або закоміченому `.env`.
+
+#### Правило
+
+Виконуйте «важкий» build на ранніх stage, а фінальний stage тримайте lean.
+Production-контейнер має містити лише те, що потрібно для запуску `dist/main.js`.
 
 </details>
