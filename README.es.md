@@ -7734,3 +7734,75 @@ Nest CLI acelera desarrollo y uniformiza arquitectura inicial; su mayor valor es
 reducir fricción y mantener consistencia en equipos.
 
 </details>
+
+<details>
+<summary>102. ¿Cómo organizar correctamente un Dockerfile para una aplicación NestJS (multi-stage build)?</summary>
+
+#### NestJS / Docker
+
+Un **multi-stage Dockerfile** permite construir imagen más pequeña, segura y
+rápida para producción, separando etapa de build y etapa de runtime.
+
+#### Objetivos
+
+1. Reducir tamaño final de imagen.
+2. Evitar incluir toolchain de build en runtime.
+3. Mejorar seguridad (menor superficie de ataque).
+4. Acelerar build con cache de dependencias.
+
+#### Ejemplo recomendado (multi-stage)
+
+```dockerfile
+# 1) Dependencies + build
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# 2) Production runtime
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+COPY --from=builder /app/dist ./dist
+
+# opcional: si usas prisma/migraciones, copiar artefactos necesarios
+# COPY --from=builder /app/prisma ./prisma
+
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+#### Puntos críticos
+
+1. `npm ci` para instalaciones reproducibles.
+2. `--omit=dev` en runtime para no llevar dependencias de desarrollo.
+3. Copiar solo `dist` y archivos necesarios.
+4. Usar `.dockerignore` (`node_modules`, `.git`, logs, etc.).
+
+#### Hardening recomendado
+
+1. Ejecutar como usuario no-root.
+2. Pin de versión base (`node:20.12-alpine` si política exige exactitud).
+3. Escaneo de vulnerabilidades de imagen en CI.
+4. Variables sensibles vía entorno/secret manager, no en imagen.
+
+#### Consideraciones NestJS
+
+1. Si usas archivos estáticos/templates, cópialos explícitamente al runtime.
+2. Si usas Prisma/TypeORM migrations, define estrategia de migración en entrypoint/CI.
+3. Healthcheck endpoint (`/health/live`) útil para orchestrator.
+
+#### Conclusión
+
+El Dockerfile multi-stage en NestJS es práctica estándar de producción: imagen
+ligera, reproducible y segura, con build y runtime claramente separados.
+
+</details>
