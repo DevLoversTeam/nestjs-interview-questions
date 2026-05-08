@@ -7668,3 +7668,69 @@ Unit da velocidad, integration valida wiring, E2E asegura comportamiento real de
 producto. Los tres niveles son complementarios, no excluyentes.
 
 </details>
+
+<details>
+<summary>101. ¿Qué es Nest CLI y qué comandos se usan con más frecuencia?</summary>
+
+#### NestJS
+
+**Nest CLI** (`@nestjs/cli`) es la herramienta oficial para crear, generar y
+operar proyectos NestJS de forma estandarizada.
+
+#### Para qué sirve
+
+1. Crear proyecto base.
+2. Generar artefactos (module/controller/service/etc.).
+3. Ejecutar app en dev/prod.
+4. Build y testing workflow.
+
+#### Comandos más usados
+
+1. `nest new <project-name>`
+   Crea un nuevo proyecto.
+
+2. `nest generate <schematic> <name>` o `nest g ...`
+   Genera código boilerplate.
+
+Ejemplos:
+
+1. `nest g module users`
+2. `nest g controller users`
+3. `nest g service users`
+4. `nest g resource users` (CRUD completo)
+
+3. `nest start`
+   Arranca la app.
+
+4. `nest start --watch`
+   Modo desarrollo con recarga.
+
+5. `nest build`
+   Compila TypeScript a `dist/`.
+
+6. `nest info`
+   Muestra versiones y entorno.
+
+#### Relación con scripts npm
+
+En muchos repos se usan scripts equivalentes:
+
+1. `npm run start:dev`
+2. `npm run build`
+3. `npm run test`
+
+CLI y scripts conviven; scripts suelen ser interfaz estándar de equipo/CI.
+
+#### Buenas prácticas
+
+1. Usar generators para mantener convención de estructura.
+2. Revisar boilerplate generado antes de commit.
+3. Evitar generación masiva sin diseño de módulos.
+4. Mantener CLI y framework en versiones compatibles.
+
+#### Conclusión
+
+Nest CLI acelera desarrollo y uniformiza arquitectura inicial; su mayor valor es
+reducir fricción y mantener consistencia en equipos.
+
+</details>
